@@ -3,7 +3,9 @@
 **Single-station seismic event location using sparse data analysis**
 
 **Author:** Neala Creasy
+
 assistance with AI Claude for visualization, readme, and organization 
+
 **Institution:** Los Alamos National Laboratory  
 **Last Updated:** 2026-07-24
 

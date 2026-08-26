@@ -35,10 +35,10 @@ conda install -c conda-forge obspy numpy matplotlib scipy pyproj pandas
 
 ### Working Directory
 
-**All commands should be run from the `FullMethod_KnownLocation/` directory:**
+**All commands should be run from the Single_Station_Seismic_Source_Determination directory:**
 
 ```bash
-cd FullMethod_KnownLocation/
+cd Single_Station_Seismic_Source_Determination/
 ```
 
 ### Basic Workflow

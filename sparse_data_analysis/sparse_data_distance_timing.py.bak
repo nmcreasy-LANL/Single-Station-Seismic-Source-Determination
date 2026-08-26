@@ -1,0 +1,2541 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Rayleigh Wave Analysis with Interactive Phase Picking - Version 4
+Created on Mon Jul 28 14:44:47 2025
+@author: nmcreasy
+
+DESCRIPTION:
+    This script performs comprehensive seismic event analysis using a two-stage workflow:
+    
+    Stage 1: Pick P & S phases → Initial coarse location estimate
+    Stage 2: Pick additional phases (PP, PS) → Refined location estimate
+    Optional: Rayleigh wave analysis → Distance and timing PDFs
+    Optional: Stockwell transform + orbit detection → Advanced Rayleigh analysis
+    Automatic: Polarization analysis → P-wave backazimuth PDF extraction
+    
+    KEY FEATURES:
+    - Interactive phase picking with real-time TauP predictions
+    - Grid search over multiple Earth models (PREM, IASP91, AK135)
+    - Rayleigh wave group velocity analysis (R1, R2, R3 orbits)
+    - Advanced Stockwell filtering with NIP energy masks
+    - Automatic backazimuth extraction from polarization analysis
+    - PDF combination (Rayleigh + body waves) for improved estimates
+    - Time reference system: Uses P-arrival as t=0 for all calculations
+    - Validation mode: Compare estimates to known event parameters (if provided)
+    - Blind mode: Works without prior knowledge of event origin time/location
+
+VERSION HISTORY:
+    v4.0: Added automatic backazimuth extraction, advanced Stockwell analysis
+    v3.0: Two-stage interactive picking workflow
+    v2.0: Grid search and PDF-based location estimation
+    v1.0: Basic Rayleigh wave group velocity analysis
+"""
+
+#═════════════════════════════════════════════════════════════════════════════════
+# IMPORTS
+#═════════════════════════════════════════════════════════════════════════════════
+
+import argparse
+import importlib.util
+import math
+import os
+import sys
+from datetime import datetime
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+from obspy import read, Trace, Stream
+from obspy.core import UTCDateTime
+from obspy.taup import TauPyModel
+from obspy.signal import filter as obspy_filter
+import obspy.signal
+
+from scipy.signal import find_peaks
+from scipy.stats import rv_histogram, norm
+
+# Import the interactive picker (must be in same directory)
+from py_picker_v2 import pick_times_multicomponent
+
+# Import distance/timing PDF functions
+from distance_timing import combine_distance_pdfs, analyze_rayleigh_waves, extract_orbit_pdfs
+
+# Import backazimuth analysis functions
+from backazimuth import (
+    analyze_rayleigh_waves_stockwell,
+    combine_baz_pdfs,
+    run_polarization_analysis,
+    run_polarization_baz_analysis
+)
+
+# Add parent directory to path for rayleigh_wave_tools import
+PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PARENT_DIR)
+#sys.path.append(0, PARENT_DIR+'/rayleigh_wave_tools')
+
+# Import Rayleigh wave tools package
+from rayleigh_wave_tools import estimate_rayleigh_baz_posterior
+from rayleigh_wave_tools.rayleigh_filter import (
+    simple_stockwell_filter_rayleigh,
+    add_particleman_nip_energy_masks,
+)
+from rayleigh_wave_tools.rayleigh_orbit_detector import detect_rayleigh_orbits_from_stockwell
+from rayleigh_wave_tools.plotting import plot_rayleigh_filter_diagnostics
+
+# Import common utilities
+UTILS_DIR = os.path.join(PARENT_DIR, 'utils')
+sys.path.insert(0, UTILS_DIR)
+import common_utils
+
+#═════════════════════════════════════════════════════════════════════════════════
+# PAR_FILE LOADING FUNCTION
+#═════════════════════════════════════════════════════════════════════════════════
+
+def load_par_file(par_file_path):
+    """
+    Dynamically load parameter file as a module and return it.
+    
+    Parameters:
+        par_file_path: Path to PAR_FILE_*.py
+    
+    Returns:
+        Module object with all parameters
+    
+    Raises:
+        FileNotFoundError: If parameter file doesn't exist
+        Exception: If parameter file cannot be loaded
+    """
+    if not os.path.exists(par_file_path):
+        raise FileNotFoundError(f"Parameter file not found: {par_file_path}")
+    
+    print(f"Loading parameters from: {par_file_path}")
+    
+    try:
+        spec = importlib.util.spec_from_file_location("par_config", par_file_path)
+        par_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(par_module)
+        print("✓ Parameters loaded successfully\n")
+        return par_module
+    except Exception as e:
+        raise Exception(f"Failed to load parameter file: {e}")
+
+#═════════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION NOTE
+#═════════════════════════════════════════════════════════════════════════════════
+#
+# ALL USER CONFIGURATION HAS BEEN MOVED TO PARAMETER FILES
+#
+# To run this script, you must specify a parameter file using --par_file argument:
+#   python sparse_data_location_analysis.py --par_file par_files/PAR_FILE_Peru.py
+#
+# Parameter files are located in: FullMethod_KnownLocation/par_files/
+#
+# To create a new analysis:
+#   1. Copy an existing PAR_FILE (e.g., PAR_FILE_Peru.py)
+#   2. Modify the parameters for your event
+#   3. Run with: python sparse_data_location_analysis.py --par_file par_files/YOUR_FILE.py
+#
+# See par_files/PAR_FILE_Peru.py for detailed parameter documentation.
+#
+#═════════════════════════════════════════════════════════════════════════════════
+
+
+#═════════════════════════════════════════════════════════════════════════════════
+# END OF USER CONFIGURATION - DO NOT MODIFY BELOW THIS LINE
+#═════════════════════════════════════════════════════════════════════════════════
+
+# Use common_utils functions directly (imported at top of file)
+# These functions are now imported from utils/common_utils.py:
+# - common_utils._is_set()
+# - common_utils.timing_from_sac_origin()
+# - common_utils.get_sac_distance_deg()
+# - common_utils.get_sac_baz_deg()
+# - common_utils.stockwell_time_axis_seconds()
+# - common_utils.tee_print()
+# - common_utils.open_log_file()
+# - common_utils.close_log_file()
+
+# Create wrapper functions to maintain compatibility
+def tee_print(*args, **kwargs):
+    """Wrapper for common_utils.tee_print()"""
+    common_utils.tee_print(*args, **kwargs)
+
+def open_log_file(output_dir):
+    """Wrapper for common_utils.open_log_file() with STATION_NAME"""
+    return common_utils.open_log_file(output_dir, STATION_NAME)
+
+def close_log_file():
+    """Wrapper for common_utils.close_log_file()"""
+    common_utils.close_log_file()
+
+def cleanup_old_logs():
+    """Clean up old analysis_log files from previous Results folders."""
+    import glob
+    
+    # Get parent directory (FullMethod_KnownLocation)
+    parent_dir = os.path.dirname(SCRIPT_DIR)
+    
+    # Find all analysis_log files in Results_* directories
+    pattern = os.path.join(parent_dir, 'Results_*', 'analysis_log_*.txt')
+    log_files = glob.glob(pattern)
+    
+    if log_files:
+        print(f"\nCleaning up {len(log_files)} old analysis_log file(s)...")
+        for log_file in log_files:
+            try:
+                os.remove(log_file)
+                print(f"  Deleted: {os.path.basename(log_file)}")
+            except Exception as e:
+                print(f"  Warning: Could not delete {os.path.basename(log_file)}: {e}")
+        print("Cleanup complete.\n")
+    else:
+        print("\nNo old analysis_log files found to clean up.\n")
+
+# Set matplotlib style for better-looking figures
+plt.style.use('seaborn-v0_8-darkgrid')
+plt.rcParams['figure.dpi'] = 150  # Reduced for better screen display
+plt.rcParams['font.size'] = 7
+plt.rcParams['axes.labelsize'] = 8
+plt.rcParams['axes.titlesize'] = 9
+plt.rcParams['xtick.labelsize'] = 6
+plt.rcParams['ytick.labelsize'] = 6
+plt.rcParams['legend.fontsize'] = 7
+plt.rcParams['figure.titlesize'] = 9
+
+#═════════════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS (DO NOT MODIFY)
+#═════════════════════════════════════════════════════════════════════════════════
+
+def create_output_directory():
+    """Wrapper for common_utils.create_output_directory() with globals."""
+    return common_utils.create_output_directory(OUTPUT_DIR, STATION_NAME)
+
+def check_files_exist():
+    """Wrapper for common_utils.check_files_exist() with globals."""
+    return common_utils.check_files_exist(FILES, DATA_DIR)
+
+def load_stream(file_list, data_dir=None):
+    """Load seismic data streams with error handling."""
+    if data_dir is None:
+        data_dir = DATA_DIR
+    st = Stream()
+    for file in file_list:
+        filepath = os.path.join(data_dir, file)
+        try:
+            st += read(filepath)
+        except Exception as e:
+            tee_print(f"Error loading {file}: {e}")
+            raise
+    return st
+
+def set_p_arrival_reference(p_pick_utc):
+    """
+    Set the P-wave arrival time as the global reference point for all subsequent times.
+    
+    Parameters:
+        p_pick_utc: UTCDateTime object of P-wave arrival
+    
+    Returns:
+        None (sets global P_ARRIVAL_TIME)
+    """
+    global P_ARRIVAL_TIME
+    P_ARRIVAL_TIME = p_pick_utc
+    
+    tee_print(f"\n{'='*80}")
+    tee_print(f"P-WAVE ARRIVAL SET AS TIME REFERENCE")
+    tee_print(f"{'='*80}")
+    tee_print(f"P-arrival time (UTC): {P_ARRIVAL_TIME}")
+    tee_print(f"All subsequent times will be relative to this P-arrival (t=0 at P)")
+    
+    if USE_KNOWN_ORIGIN and EVENT_TIME is not None:
+        p_to_origin = EVENT_TIME - P_ARRIVAL_TIME
+        tee_print(f"\n[VALIDATION MODE]")
+        tee_print(f"Known origin time: {EVENT_TIME}")
+        tee_print(f"P-to-origin offset: {p_to_origin:.2f}s (origin is {p_to_origin:.2f}s before P)")
+    
+    tee_print(f"{'='*80}\n")
+
+# Time conversion utilities: use common_utils.utc_to_relative() and common_utils.relative_to_utc()
+# Use common_utils.format_time_with_uncertainty directly when needed
+
+def print_validation_summary(rayleigh_distance=None, body_distance=None, combined_distance=None,
+                             body_depth=None, rayleigh_t0=None, body_t0=None, combined_t0=None,
+                             rayleigh_t0_std=None, body_t0_std=None, combined_t0_std=None):
+    """
+    Print comprehensive validation summary comparing estimates to true values.
+    
+    Parameters:
+        rayleigh_distance: Rayleigh wave distance estimate (degrees)
+        body_distance: Body wave distance estimate (degrees)
+        combined_distance: Combined distance estimate (degrees)
+        body_depth: Body wave depth estimate (km)
+        rayleigh_t0: Rayleigh wave origin time offset (seconds before P)
+        body_t0: Body wave origin time offset (seconds before P)
+        combined_t0: Combined origin time offset (seconds before P)
+        rayleigh_t0_std: Rayleigh wave timing uncertainty (seconds)
+        body_t0_std: Body wave timing uncertainty (seconds)
+        combined_t0_std: Combined timing uncertainty (seconds)
+    """
+    if not USE_KNOWN_ORIGIN or EVENT_TIME is None or P_ARRIVAL_TIME is None:
+        tee_print("\n" + "="*80)
+        tee_print("BLIND MODE - No validation available (EVENT_TIME unknown)")
+        tee_print("="*80)
+        tee_print("Results are reported relative to P-arrival time reference.")
+        tee_print("="*80 + "\n")
+        return
+    
+    tee_print("\n" + "="*80)
+    tee_print("VALIDATION MODE - FINAL SUMMARY")
+    tee_print("="*80)
+    
+    # Calculate true P-to-origin offset
+    true_p_to_origin = EVENT_TIME - P_ARRIVAL_TIME
+    
+    tee_print("\nTRUE VALUES:")
+    tee_print(f"  Origin time (UTC): {EVENT_TIME}")
+    tee_print(f"  P-arrival (UTC): {P_ARRIVAL_TIME}")
+    tee_print(f"  P-to-origin offset: {true_p_to_origin:.1f}s (origin is {true_p_to_origin:.1f}s before P)")
+    tee_print(f"  Distance: {DISTANCE_DEG}°")
+    tee_print(f"  Depth: {SOURCE_DEPTH_KM} km")
+    
+    tee_print("\nESTIMATED VALUES:")
+    
+    # Distance estimates
+    tee_print("\n  Distance Estimates:")
+    if rayleigh_distance is not None:
+        error = abs(rayleigh_distance - DISTANCE_DEG)
+        tee_print(f"    Rayleigh waves: {rayleigh_distance:.2f}° (error: {error:.2f}°)")
+    if body_distance is not None:
+        error = abs(body_distance - DISTANCE_DEG)
+        tee_print(f"    Body waves:     {body_distance:.2f}° (error: {error:.2f}°)")
+    if combined_distance is not None:
+        error = abs(combined_distance - DISTANCE_DEG)
+        tee_print(f"    COMBINED:       {combined_distance:.2f}° (error: {error:.2f}°)")
+    
+    # Depth estimate
+    if body_depth is not None:
+        error = abs(body_depth - SOURCE_DEPTH_KM)
+        tee_print(f"\n  Depth Estimate:")
+        tee_print(f"    Body waves: {body_depth:.1f} km (error: {error:.1f} km)")
+    
+    # Origin time estimates
+    tee_print(f"\n  Origin Time Estimates (relative to P-arrival):")
+    if rayleigh_t0 is not None:
+        error = abs(rayleigh_t0 - true_p_to_origin)
+        std_str = f" ±{rayleigh_t0_std:.1f}s" if rayleigh_t0_std else ""
+        tee_print(f"    Rayleigh waves: {rayleigh_t0:.1f}s{std_str} (error: {error:.1f}s)")
+    if body_t0 is not None:
+        error = abs(body_t0 - true_p_to_origin)
+        std_str = f" ±{body_t0_std:.1f}s" if body_t0_std else ""
+        tee_print(f"    Body waves:     {body_t0:.1f}s{std_str} (error: {error:.1f}s)")
+    if combined_t0 is not None:
+        error = abs(combined_t0 - true_p_to_origin)
+        std_str = f" ±{combined_t0_std:.1f}s" if combined_t0_std else ""
+        tee_print(f"    COMBINED:       {combined_t0:.1f}s{std_str} (error: {error:.1f}s)")
+        
+        # Show absolute UTC time
+        estimated_origin_utc = P_ARRIVAL_TIME + combined_t0
+        tee_print(f"\n  Estimated Origin (UTC): {estimated_origin_utc}")
+        tee_print(f"  True Origin (UTC):      {EVENT_TIME}")
+        utc_error = abs(estimated_origin_utc - EVENT_TIME)
+        tee_print(f"  UTC Time Error:         {utc_error:.1f}s")
+    
+    tee_print("\n" + "="*80)
+    tee_print("VALIDATION COMPLETE")
+    tee_print("="*80 + "\n")
+
+
+#=================================================================================================
+# Interactive Phase Picking Function
+#=================================================================================================
+
+def interactive_phase_picking(st_filt, EVENT_TIME, phases, distance_range, depth_range, 
+                               stage_name="", stage1_picks=None):
+    """
+    Perform interactive phase picking on three-component data.
+    
+    Parameters:
+        st_filt: filtered ObsPy stream (3 components)
+        EVENT_TIME: event origin time
+        phases: list of phase names to pick
+        distance_range: [min, max] distance in degrees for TauP
+        depth_range: [min, max] depth in km for TauP
+        stage_name: string identifier for this picking stage
+        stage1_picks: dict of Stage 1 picks (for Stage 2 reference)
+    
+    Returns:
+        picks_dict: dictionary of picked times (in seconds relative to event)
+    """
+    tee_print(f"\n{'='*80}")
+    tee_print(f"INTERACTIVE PHASE PICKING {stage_name}")
+    tee_print(f"{'='*80}")
+    tee_print(f"Phases to pick: {', '.join(phases)}")
+    tee_print(f"TauP distance range: {distance_range[0]}-{distance_range[1]}°")
+    tee_print(f"TauP depth range: {depth_range[0]}-{depth_range[1]} km")
+    
+    npts = st_filt[0].stats.npts
+    samprate = st_filt[0].stats.sampling_rate
+    t = np.arange(0, npts / samprate, 1 / samprate)
+    
+    start = st_filt[0].stats.starttime
+    diff1 = start - EVENT_TIME
+    
+    # Extract components (E, Z, N order in stream)
+    dataZ = st_filt[1].data
+    dataE = st_filt[0].data
+    dataN = st_filt[2].data
+    
+    tee_print(f"\nLaunching interactive picker...")
+    tee_print(f"  Stream start time: {start}")
+    tee_print(f"  Event time: {EVENT_TIME}")
+    tee_print(f"  diff1 (start - event): {diff1:.2f} seconds")
+    tee_print(f"  Data length: {npts} samples = {npts/samprate:.2f} seconds")
+    tee_print(f"  Time array: t[0]={t[0]:.2f}s, t[-1]={t[-1]:.2f}s")
+    tee_print(f"  Window will open - use mouse/keyboard to pick phases")
+    tee_print(f"  Press 'q' when done picking")
+    
+    # Call the interactive picker with UTC time display
+    picks = pick_times_multicomponent(
+        t,  # time in seconds from start of trace
+        dataZ,
+        dataN,
+        dataE,
+        phases=phases,
+        distance_range=distance_range,
+        depth_range=depth_range,
+        event_time=diff1,  # offset to align with event time
+        start_time=start  # Pass UTCDateTime for UTC display
+    )
+    
+    # Convert picks from trace time to event-relative time (or to UTC if EVENT_TIME available)
+    picks_relative = {}
+    picks_utc = {}
+    
+    for phase, times in picks.items():
+        if times:
+            # Store as seconds relative to event (for backward compatibility)
+            picks_relative[phase] = [t + diff1 for t in times]
+            
+            # Also store as UTC timestamps
+            picks_utc[phase] = [start + t for t in times]
+        else:
+            picks_relative[phase] = []
+            picks_utc[phase] = []
+    
+    # Set P_ARRIVAL_TIME from first P-pick (becomes global time reference)
+    if 'P' in picks_utc and len(picks_utc['P']) > 0:
+        set_p_arrival_reference(picks_utc['P'][0])
+    
+    # Print summary
+    tee_print(f"\n{'='*80}")
+    tee_print(f"PICKING COMPLETE {stage_name}")
+    tee_print(f"{'='*80}")
+    for phase in phases:
+        if picks_relative[phase]:
+            tee_print(f"  {phase}: {len(picks_relative[phase])} pick(s)")
+            for i, t in enumerate(picks_relative[phase], 1):
+                utc_time = picks_utc[phase][i-1]
+                if P_ARRIVAL_TIME is not None:
+                    rel_to_p = common_utils.utc_to_relative(utc_time, P_ARRIVAL_TIME)
+                    tee_print(f"    {phase}{i}: {t:.2f}s after event | {rel_to_p:.2f}s after P | UTC: {utc_time}")
+                else:
+                    tee_print(f"    {phase}{i}: {t:.2f}s after event | UTC: {utc_time}")
+        else:
+            tee_print(f"  {phase}: No picks")
+    tee_print(f"{'='*80}\n")
+    
+    return picks_relative
+
+#=================================================================================================
+# Polarization Analysis Functions (for Backazimuth Extraction)
+#=================================================================================================
+# NOTE: combine_baz_pdfs() and run_polarization_analysis() are now imported from backazimuth.py
+
+def fwhm_error_from_kde(xs, ys, index):
+    """
+    Calculate the Full Width at Half Maximum (FWHM) error from KDE curve.
+    Copied from plot_pwave_baz_from_pickle.py for internal use.
+    
+    Parameters:
+        xs: x-values (backazimuth angles)
+        ys: y-values (probability density)
+        index: index of maximum value
+    
+    Returns:
+        error: [left_error, right_error] in degrees
+    """
+    max_y = max(ys)
+    indexes_ymax = [x for x in range(len(ys)) if ys[x] > max_y/2.0]
+    
+    if len(indexes_ymax) == 0:
+        baz = xs[index]
+        if baz < 0:
+            baz = baz + 360
+        elif baz > 360:
+            baz = baz - 360
+        return [baz - 10, baz + 10]
+    
+    if index not in indexes_ymax:
+        closest_idx = min(indexes_ymax, key=lambda x: abs(x - index))
+        index_local = indexes_ymax.index(closest_idx)
+    else:
+        index_local = indexes_ymax.index(index)
+    
+    index_high = indexes_ymax[-1]
+    index_low = indexes_ymax[0]
+    
+    for k in range(index_local, len(indexes_ymax)-1):
+        if indexes_ymax[k+1] > indexes_ymax[k]+1:
+            index_high = indexes_ymax[k]
+            break
+        elif k == len(indexes_ymax)-2:
+            index_high = indexes_ymax[-1]
+    
+    for k in range(index_local, 0, -1):
+        if indexes_ymax[k-1] < indexes_ymax[k]-1:
+            index_low = indexes_ymax[k]
+            break
+        elif k == 1:
+            index_low = indexes_ymax[0]
+    
+    left_error = xs[index_low]
+    right_error = xs[index_high]
+    
+    if left_error < 0.:
+        left_error = 360. + left_error
+    if right_error > 360.:
+        right_error = right_error - 360.
+    
+    error = [left_error, right_error]
+    return error
+
+
+def calculate_baz_from_kde(kde_data, kde_weights):
+    """
+    Calculate backazimuth and error from KDE data.
+    Copied from plot_pwave_baz_from_pickle.py for internal use.
+    
+    Parameters:
+        kde_data: Array of azimuth values
+        kde_weights: Array of weights for KDE
+    
+    Returns:
+        baz: Peak backazimuth in degrees
+        error: [left_error, right_error] in degrees
+        xs: x-values for plotting
+        ys: y-values for plotting
+    """
+    from scipy import stats
+    
+    kde_data = np.array(kde_data)
+    kde_data = np.where(kde_data < 0, kde_data + 360, kde_data)
+    
+    kernel = stats.gaussian_kde(kde_data, weights=kde_weights)
+    kernel.covariance_factor = lambda: .08
+    kernel._compute_covariance()
+    
+    xs = np.linspace(-50, 360+50, 1000)
+    ys = kernel(xs)
+    
+    index = np.argmax(ys)
+    baz = xs[index]
+    
+    if baz < 0:
+        baz = baz + 360
+    elif baz > 360:
+        baz = baz - 360
+    
+    error = fwhm_error_from_kde(xs, ys, index)
+    
+    return baz, error, xs, ys
+
+
+def extract_baz_from_pickle(pickle_path, wave_type, output_dir, event_name):
+    """
+    Extract backazimuth PDF from polarization pickle file.
+    
+    Parameters:
+        pickle_path: Path to pickle file
+        wave_type: 'P' or 'P-from-S'
+        output_dir: Output directory for plots
+        event_name: Event name for file naming
+    
+    Returns:
+        tuple: (baz, error, pdf_x, pdf_y) or (None, None, None, None) if error
+    """
+    import pickle as pkl
+    
+    output_file = os.path.join(output_dir, f'{event_name}_BAZ_{wave_type.replace("-", "_")}.png')
+    
+    tee_print(f"  Extracting {wave_type} backazimuth...")
+    
+    # Check if pickle file exists
+    if not os.path.exists(pickle_path):
+        tee_print(f"  ERROR: Pickle file not found: {pickle_path}")
+        return None, None, None, None
+    
+    try:
+        # Load pickle file directly
+        with open(pickle_path, 'rb') as f:
+            kde_dataframe = pkl.load(f)
+        
+        if wave_type == 'P':
+            # Extract P-wave data
+            if isinstance(kde_dataframe, dict) and 'P' in kde_dataframe:
+                p_wave_list = kde_dataframe['P']
+                p_wave_data = p_wave_list[1]  # Row 1 = azimuth
+                
+                if 'P' in p_wave_data and 'weights' in p_wave_data:
+                    # Calculate BAZ and get full PDF
+                    baz, error, xs, ys = calculate_baz_from_kde(
+                        p_wave_data['P'],
+                        p_wave_data['weights']
+                    )
+                    
+                    # Create plot using plot_pwave_baz_from_pickle if available
+                    try:
+                        from plot_pwave_baz_from_pickle import plot_pwave_baz_pdf
+                        plot_pwave_baz_pdf(pickle_path, output_file=output_file, show_plot=False)
+                    except:
+                        # Create simple plot ourselves
+                        fig, ax = plt.subplots(figsize=(5, 2.5))
+                        valid_mask = (xs >= 0) & (xs <= 360)
+                        ax.plot(xs[valid_mask], ys[valid_mask], 'C0', linewidth=2.5, label='P-wave')
+                        ax.fill_between(xs[valid_mask], ys[valid_mask], alpha=0.3, color='C0')
+                        ax.axvline(baz, color='C0', linestyle='--', linewidth=1.5, alpha=0.7)
+                        ax.set_xlabel('Backazimuth (°)', fontsize=13)
+                        ax.set_ylabel('Probability Density', fontsize=13)
+                        ax.set_title('P-wave Backazimuth PDF', fontsize=14, fontweight='bold')
+                        ax.set_xlim(0, 360)
+                        ax.grid(True, alpha=0.3)
+                        ax.legend()
+                        plt.tight_layout()
+                        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+                        plt.close()
+                    
+                    if baz is not None:
+                        tee_print(f"  {wave_type} BAZ: {baz:.1f}° [{error[0]:.1f}°, {error[1]:.1f}°]")
+                        tee_print(f"  Plot saved: {output_file}")
+                    
+                    return baz, error, xs, ys
+                else:
+                    tee_print(f"  ERROR: Expected data structure not found")
+                    return None, None, None, None
+            else:
+                tee_print(f"  ERROR: Unexpected pickle structure")
+                return None, None, None, None
+                
+        else:  # P-from-S
+            # Use the external function for P-from-S (more complex)
+            try:
+                from plot_pwave_baz_from_pickle import plot_pwave_from_swave_pdf
+                baz, error = plot_pwave_from_swave_pdf(
+                    pickle_path,
+                    output_file=output_file,
+                    show_plot=False
+                )
+                # For P-from-S, we don't have easy access to PDF arrays
+                # Return None for now (can be enhanced later)
+                if baz is not None:
+                    tee_print(f"  {wave_type} BAZ: {baz:.1f}° [{error[0]:.1f}°, {error[1]:.1f}°]")
+                    tee_print(f"  Plot saved: {output_file}")
+                return baz, error, None, None
+            except Exception as e:
+                tee_print(f"  ERROR: {e}")
+                return None, None, None, None
+        
+    except Exception as e:
+        tee_print(f"ERROR extracting BAZ: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None, None
+
+
+def estimate_rayleigh_baz_from_r1(st_raw, r1_arrival_utc, window_duration=120, 
+                                   fmin_hz=0.01, fmax_hz=3.0, output_dir=None, event_name=None):
+    """
+    Estimate Rayleigh wave backazimuth using sophisticated multi-band algorithm.
+    
+    Parameters:
+        st_raw: Raw ObsPy stream (3-component: [E, Z, N])
+        r1_arrival_utc: UTC time of R1 Rayleigh wave arrival
+        window_duration: Analysis window duration in seconds (default: 120s)
+        fmin_hz: Minimum frequency (default: 0.01 Hz = 100s period)
+        fmax_hz: Maximum frequency (default: 3.0 Hz = 0.33s period)
+        output_dir: Output directory for plots
+        event_name: Event name for file naming
+    
+    Returns:
+        dict: {'baz_deg', 'uncertainty_deg', 'posterior', 'azimuth_range', 'reliability', 'full_result'}
+    """
+    tee_print(f"\n{'='*80}")
+    tee_print(f"RAYLEIGH WAVE BACKAZIMUTH ESTIMATION")
+    tee_print(f"{'='*80}")
+    tee_print(f"Using sophisticated Hilbert-Bayes multi-band algorithm")
+    tee_print(f"R1 arrival: {r1_arrival_utc}")
+    tee_print(f"Window: {window_duration}s centered on R1")
+    tee_print(f"Frequency range: {fmin_hz:.4f} - {fmax_hz:.4f} Hz ({1/fmax_hz:.0f}-{1/fmin_hz:.0f}s period)")
+    
+    # Extract window around R1
+    t_start = r1_arrival_utc - window_duration/2
+    t_end = r1_arrival_utc + window_duration/2
+    st_window = st_raw.copy().slice(t_start, t_end)
+    
+    if len(st_window) < 3:
+        tee_print("ERROR: Incomplete 3-component data")
+        return None
+    
+    # Extract components (assuming E, Z, N order)
+    E = st_window[0].data
+    Z = st_window[1].data
+    N = st_window[2].data
+    fs = st_window[0].stats.sampling_rate
+    
+    tee_print(f"Data: {len(E)} samples @ {fs} Hz")
+    tee_print(f"Running BAZ estimation algorithm...")
+    
+    try:
+        result = estimate_rayleigh_baz_posterior(
+            north=N,
+            east=E,
+            vertical=Z,
+            fs=fs,
+            fmin_hz=fmin_hz,
+            fmax_hz=fmax_hz,
+            return_band_details=True
+        )
+        
+        baz_est = result['best_estimate_deg']
+        baz_std = result['posterior_std_deg']
+        reliability = result['reliability']
+        
+        tee_print(f"\n{'─'*80}")
+        tee_print(f"RESULTS:")
+        tee_print(f"  Backazimuth: {baz_est:.1f}° ± {baz_std:.1f}°")
+        tee_print(f"  Reliability: {reliability:.3f}")
+        tee_print(f"{'─'*80}")
+        
+        # Plot if output directory provided
+        if output_dir and event_name:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.fill_between(result['azimuth_range'], result['posterior'], alpha=0.3, color='blue')
+            ax.plot(result['azimuth_range'], result['posterior'], 'b-', linewidth=2)
+            ax.axvline(baz_est, color='red', linestyle='-', linewidth=2, 
+                      label=f'Peak: {baz_est:.1f}° ± {baz_std:.1f}°')
+            ax.set_xlabel('Backazimuth (°)', fontweight='bold')
+            ax.set_ylabel('Posterior Probability', fontweight='bold')
+            ax.set_title(f'Rayleigh Wave Backazimuth (R1)\nReliability: {reliability:.3f}', 
+                        fontweight='bold')
+            ax.set_xlim(0, 360)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            fig_path = os.path.join(output_dir, f'{event_name}_rayleigh_baz.png')
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            tee_print(f"  Plot saved: {fig_path}")
+            plt.show(block=False)
+            plt.pause(0.1)
+        
+        tee_print(f"{'='*80}\n")
+        
+        return {
+            'baz_deg': baz_est,
+            'uncertainty_deg': baz_std,
+            'posterior': result['posterior'],
+            'azimuth_range': result['azimuth_range'],
+            'reliability': reliability,
+            'full_result': result
+        }
+        
+    except Exception as e:
+        tee_print(f"ERROR in BAZ estimation: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+#=================================================================================================
+# Grid Search Function
+#=================================================================================================
+
+def run_grid_search(picks_dict, stage_name="", stage=1, prev_distance=None, prev_depth=None):
+    """
+    Run grid search for distance and depth estimation.
+    
+    Parameters:
+        picks_dict: dictionary of picked phases {phase: [times]}
+        stage_name: string identifier
+        stage: int, 1 or 2 indicating which stage (1=broad, 2=refined)
+        prev_distance: previous distance estimate (degrees) for Stage 2 centering
+        prev_depth: previous depth estimate (km) for Stage 2 centering
+    
+    Returns:
+        tuple: (estimated_distance, estimated_depth, distance_pdf, depth_pdf)
+    """
+    tee_print(f"\n{'='*80}")
+    tee_print(f"GRID SEARCH - Distance/Depth Estimation {stage_name}")
+    tee_print(f"{'='*80}")
+    
+    # Select appropriate grid based on stage
+    if stage == 1:
+        # Stage 1: Broad grid
+        GRID_SEARCH_DEPTHS = STAGE1_GRID_DEPTHS
+        GRID_SEARCH_DISTANCES = STAGE1_GRID_DISTANCES
+        tee_print(f"Using Stage 1 broad grid:")
+        tee_print(f"  Distance: {GRID_SEARCH_DISTANCES[0]:.1f}-{GRID_SEARCH_DISTANCES[-1]:.1f}° ({len(GRID_SEARCH_DISTANCES)} points)")
+        tee_print(f"  Depth: {GRID_SEARCH_DEPTHS[0]:.1f}-{GRID_SEARCH_DEPTHS[-1]:.1f} km ({len(GRID_SEARCH_DEPTHS)} points)")
+    else:
+        # Stage 2: Refined grid centered on previous estimate
+        if prev_distance is not None and prev_depth is not None:
+            dist_min = max(5, prev_distance - STAGE2_DISTANCE_BUFFER)
+            dist_max = min(98, prev_distance + STAGE2_DISTANCE_BUFFER)
+            depth_min = max(0, prev_depth - STAGE2_DEPTH_BUFFER)
+            depth_max = min(700, prev_depth + STAGE2_DEPTH_BUFFER)
+            
+            GRID_SEARCH_DISTANCES = np.arange(dist_min, dist_max + STAGE2_DISTANCE_SPACING, STAGE2_DISTANCE_SPACING)
+            GRID_SEARCH_DEPTHS = np.arange(depth_min, depth_max + STAGE2_DEPTH_SPACING, STAGE2_DEPTH_SPACING)
+            
+            tee_print(f"Using Stage 2 refined grid (centered on Stage 1 results):")
+            tee_print(f"  Previous estimate: {prev_distance:.1f}° at {prev_depth:.1f} km")
+            tee_print(f"  Distance: {dist_min:.1f}-{dist_max:.1f}° ({len(GRID_SEARCH_DISTANCES)} points)")
+            tee_print(f"  Depth: {depth_min:.1f}-{depth_max:.1f} km ({len(GRID_SEARCH_DEPTHS)} points)")
+        else:
+            tee_print("WARNING: No previous estimate provided for Stage 2. Using Stage 1 grid.")
+            GRID_SEARCH_DEPTHS = STAGE1_GRID_DEPTHS
+            GRID_SEARCH_DISTANCES = STAGE1_GRID_DISTANCES
+    
+    # Select picks (use first pick of each phase)
+    p_pick = picks_dict['P'][0] if picks_dict.get('P') else None
+    pp_pick = picks_dict['PP'][0] if picks_dict.get('PP') else None
+    s_pick = picks_dict['S'][0] if picks_dict.get('S') else None
+    ps_pick = picks_dict['PS'][0] if picks_dict.get('PS') else None
+    
+    tee_print(f"\nSelected picks for grid search:")
+    tee_print(f"  P:  {p_pick:.2f}s" if p_pick else "  P:  None")
+    tee_print(f"  PP: {pp_pick:.2f}s" if pp_pick else "  PP: None")
+    tee_print(f"  S:  {s_pick:.2f}s" if s_pick else "  S:  None")
+    tee_print(f"  PS: {ps_pick:.2f}s" if ps_pick else "  PS: None")
+    
+    if p_pick is None:
+        tee_print("\nWARNING: No P pick available, skipping grid search")
+        return None, None, None, None
+    
+    tee_print(f"\nGrid search parameters:")
+    tee_print(f"  Depth range: {GRID_SEARCH_DEPTHS[0]}-{GRID_SEARCH_DEPTHS[-1]} km ({len(GRID_SEARCH_DEPTHS)} points)")
+    tee_print(f"  Distance range: {GRID_SEARCH_DISTANCES[0]:.1f}-{GRID_SEARCH_DISTANCES[-1]:.1f}° ({len(GRID_SEARCH_DISTANCES)} points)")
+    tee_print(f"  Models: {', '.join(GRID_SEARCH_MODELS)}")
+    
+    n_models = len(GRID_SEARCH_MODELS)
+    n_depths = len(GRID_SEARCH_DEPTHS)
+    n_distances = len(GRID_SEARCH_DISTANCES)
+    total_points = n_models * n_depths
+    
+    predP = np.zeros((total_points, n_distances))
+    predPP = np.zeros((total_points, n_distances))
+    predS = np.zeros((total_points, n_distances))
+    predPS = np.zeros((total_points, n_distances))
+    DISTS = np.zeros((total_points, n_distances))
+    DEPTHS = np.zeros((total_points, n_distances))
+    
+    tee_print("\nCalculating predicted travel times...")
+    q = -1
+    for k, model_name in enumerate(GRID_SEARCH_MODELS):
+        model_grid = TauPyModel(model=model_name)
+        tee_print(f"  Processing model: {model_name}")
+        
+        for i, depth in enumerate(GRID_SEARCH_DEPTHS):
+            q += 1
+            for p, distance in enumerate(GRID_SEARCH_DISTANCES):
+                arrivals_grid = model_grid.get_travel_times(
+                    source_depth_in_km=depth,
+                    distance_in_degree=distance,
+                    phase_list=["P", "PP", "S", "PS"]
+                )
+                
+                if len(arrivals_grid) >= 4:
+                    predP[q, p] = arrivals_grid[0].time
+                    predPP[q, p] = arrivals_grid[1].time
+                    predS[q, p] = arrivals_grid[2].time
+                    predPS[q, p] = arrivals_grid[3].time
+                
+                DISTS[q, p] = distance
+                DEPTHS[q, p] = depth
+    
+    tee_print("Travel time calculations complete.")
+    
+    # ==================================================================================
+    # STEP 1: Calculate differential travel times
+    # ==================================================================================
+    # Use differential times (phase_arrival - P_arrival) to eliminate origin time
+    # This makes the problem independent of when the earthquake actually occurred
+    PPref = predPP - predP  # PP-P differential times for all grid points
+    PSref = predS - predP   # S-P differential times for all grid points
+    PSSref = predPS - predP # PS-P differential times for all grid points
+    
+    # Observed differential times from our picks
+    PP_obs = (pp_pick - p_pick) if pp_pick is not None else None
+    S_obs = (s_pick - p_pick) if s_pick is not None else None
+    PS_obs = (ps_pick - p_pick) if ps_pick is not None else None
+    
+    # ==================================================================================
+    # STEP 2: Calculate probability distributions using Bayesian approach
+    # ==================================================================================
+    # For each distance, calculate the probability that our observed pick matches
+    # the predicted travel time at that distance, accounting for pick uncertainty
+    
+    dx = 0.01  # Time sampling interval (seconds)
+    intgPP = np.zeros(n_distances)   # Probability for each distance (PP-P)
+    intgPS = np.zeros(n_distances)   # Probability for each distance (S-P)
+    intgPSS = np.zeros(n_distances)  # Probability for each distance (PS-P)
+    
+    tee_print("\nCalculating probability distributions...")
+    
+    # PP-P differential probability
+    # ALGORITHM: For each distance, calculate overlap between:
+    #   1) Observed pick uncertainty (uniform distribution ± sigma/2)
+    #   2) Model prediction uncertainty (Gaussian from depth/model spread)
+    if PP_obs is not None:
+        # Create time axis spanning all possible predicted times
+        tms = np.arange(np.min(PPref) - 20, np.max(PPref) + 20, dx)
+        
+        # Observed pick likelihood: uniform distribution within uncertainty window
+        sigma_pp = PICK_UNCERTAINTY_PP  # Pick uncertainty (seconds)
+        fobs_pp = np.where(
+            (tms >= PP_obs - 0.5*sigma_pp) & (tms <= PP_obs + 0.5*sigma_pp),
+            1/sigma_pp,  # Uniform probability within window
+            0            # Zero probability outside window
+        )
+        
+        # For each distance, calculate probability
+        for j in range(n_distances):
+            pdf_pp = norm.pdf(tms, loc=np.mean(PPref[:, j]), scale=np.std(PPref[:, j]))
+            integrand = fobs_pp * pdf_pp
+            intgPP[j] = np.trapz(integrand, dx=dx)
+    
+    # S-P differential
+    if S_obs is not None:
+        tms2 = np.arange(np.min(PSref) - 20, np.max(PSref) + 20, dx)
+        sigma_s = PICK_UNCERTAINTY_S
+        fobs_s = np.where(
+            (tms2 >= S_obs - 0.5*sigma_s) & (tms2 <= S_obs + 0.5*sigma_s),
+            1/sigma_s, 0
+        )
+        for j in range(n_distances):
+            pdf_s = norm.pdf(tms2, loc=np.mean(PSref[:, j]), scale=np.std(PSref[:, j]))
+            integrand = fobs_s * pdf_s
+            intgPS[j] = np.trapz(integrand, dx=dx)
+    
+    # PS-P differential
+    if PS_obs is not None:
+        tms3 = np.arange(np.min(PSSref) - 20, np.max(PSSref) + 20, dx)
+        sigma_ps = PICK_UNCERTAINTY_PS
+        fobs_ps = np.where(
+            (tms3 >= PS_obs - 0.5*sigma_ps) & (tms3 <= PS_obs + 0.5*sigma_ps),
+            1/sigma_ps, 0
+        )
+        for j in range(n_distances):
+            pdf_ps = norm.pdf(tms3, loc=np.mean(PSSref[:, j]), scale=np.std(PSSref[:, j]))
+            integrand = fobs_ps * pdf_ps
+            intgPSS[j] = np.trapz(integrand, dx=dx)
+    
+    tee_print("Probability calculations complete.")
+    
+    # Combined distance PDF
+    SUMphase = intgPP + intgPS + intgPSS
+    
+    if np.max(SUMphase) > 0:
+        max_idx = np.argmax(SUMphase)
+        estimated_dist = GRID_SEARCH_DISTANCES[max_idx]
+    else:
+        estimated_dist = None
+    
+    # Calculate depth PDF (marginalize over distance)
+    intgPP_depth = np.zeros(n_depths)
+    intgPS_depth = np.zeros(n_depths)
+    intgPSS_depth = np.zeros(n_depths)
+    
+    tee_print("\nCalculating depth probability distributions...")
+    
+    for depth_idx in range(n_depths):
+        depth_rows = [model_idx * n_depths + depth_idx for model_idx in range(n_models)]
+        
+        # PP-P for this depth
+        if PP_obs is not None:
+            tms = np.arange(np.min(PPref[depth_rows, :]) - 20, np.max(PPref[depth_rows, :]) + 20, dx)
+            sigma_pp = PICK_UNCERTAINTY_PP
+            fobs_pp = np.where(
+                (tms >= PP_obs - 0.5*sigma_pp) & (tms <= PP_obs + 0.5*sigma_pp),
+                1/sigma_pp, 0
+            )
+            prob_sum = 0
+            for row in depth_rows:
+                for j in range(n_distances):
+                    pdf_pp = norm.pdf(tms, loc=PPref[row, j], scale=PICK_UNCERTAINTY_PP)
+                    integrand = fobs_pp * pdf_pp
+                    prob_sum += np.trapz(integrand, dx=dx)
+            intgPP_depth[depth_idx] = prob_sum / (n_models * n_distances)
+        
+        # S-P for this depth
+        if S_obs is not None:
+            tms2 = np.arange(np.min(PSref[depth_rows, :]) - 20, np.max(PSref[depth_rows, :]) + 20, dx)
+            sigma_s = PICK_UNCERTAINTY_S
+            fobs_s = np.where(
+                (tms2 >= S_obs - 0.5*sigma_s) & (tms2 <= S_obs + 0.5*sigma_s),
+                1/sigma_s, 0
+            )
+            prob_sum = 0
+            for row in depth_rows:
+                for j in range(n_distances):
+                    pdf_s = norm.pdf(tms2, loc=PSref[row, j], scale=PICK_UNCERTAINTY_S)
+                    integrand = fobs_s * pdf_s
+                    prob_sum += np.trapz(integrand, dx=dx)
+            intgPS_depth[depth_idx] = prob_sum / (n_models * n_distances)
+        
+        # PS-P for this depth
+        if PS_obs is not None:
+            tms3 = np.arange(np.min(PSSref[depth_rows, :]) - 20, np.max(PSSref[depth_rows, :]) + 20, dx)
+            sigma_ps = PICK_UNCERTAINTY_PS
+            fobs_ps = np.where(
+                (tms3 >= PS_obs - 0.5*sigma_ps) & (tms3 <= PS_obs + 0.5*sigma_ps),
+                1/sigma_ps, 0
+            )
+            prob_sum = 0
+            for row in depth_rows:
+                for j in range(n_distances):
+                    pdf_ps = norm.pdf(tms3, loc=PSSref[row, j], scale=PICK_UNCERTAINTY_PS)
+                    integrand = fobs_ps * pdf_ps
+                    prob_sum += np.trapz(integrand, dx=dx)
+            intgPSS_depth[depth_idx] = prob_sum / (n_models * n_distances)
+    
+    tee_print("Depth probability calculations complete.")
+    
+    # Combined depth PDF
+    SUMphase_depth = intgPP_depth + intgPS_depth + intgPSS_depth
+    
+    if np.max(SUMphase_depth) > 0:
+        max_idx_depth = np.argmax(SUMphase_depth)
+        estimated_depth = GRID_SEARCH_DEPTHS[max_idx_depth]
+    else:
+        estimated_depth = None
+    
+    # Plot results
+    fig, ax = plt.subplots(figsize=(5, 2.5))
+    ax.plot(GRID_SEARCH_DISTANCES, SUMphase, 'b-', linewidth=1.5, label='Combined PDF')
+    ax.axvline(DISTANCE_DEG, color='r', linestyle='-', linewidth=0.8,
+              label=f'True distance: {DISTANCE_DEG}°', alpha=0.8)
+    if estimated_dist:
+        ax.plot(estimated_dist, SUMphase[max_idx], 'k*', markersize=12, 
+               label=f'Estimated: {estimated_dist:.2f}°', zorder=10)
+    ax.set_xlabel('Distance (degrees)', fontweight='bold', fontsize=9)
+    ax.set_ylabel('Combined Probability Density', fontweight='bold', fontsize=9)
+    ax.set_title(f'Body Wave Distance Estimation {stage_name}', fontweight='bold', fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save figure
+    stage_suffix = stage_name.replace('(', '').replace(')', '').replace(' ', '_').lower()
+    fig_path = os.path.join(OUTPUT_DIR, f'bodywave_distance_pdf{stage_suffix}.png')
+    plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+    tee_print(f"  Saved: {fig_path}")
+    
+    plt.show(block=False)
+    plt.pause(0.1)
+    
+    # Plot depth
+    fig, ax = plt.subplots(figsize=(5, 2.5))
+    ax.plot(GRID_SEARCH_DEPTHS, SUMphase_depth, 'b-', linewidth=1.5, label='Combined PDF')
+    ax.axvline(SOURCE_DEPTH_KM, color='r', linestyle='-', linewidth=0.8,
+              label=f'True depth: {SOURCE_DEPTH_KM} km', alpha=0.8)
+    if estimated_depth:
+        ax.plot(estimated_depth, SUMphase_depth[max_idx_depth], 'k*', markersize=12, 
+               label=f'Estimated: {estimated_depth:.1f} km', zorder=10)
+    ax.set_xlabel('Depth (km)', fontweight='bold', fontsize=9)
+    ax.set_ylabel('Combined Probability Density', fontweight='bold', fontsize=9)
+    ax.set_title(f'Body Wave Depth Estimation {stage_name}', fontweight='bold', fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Save figure
+    fig_path = os.path.join(OUTPUT_DIR, f'bodywave_depth_pdf{stage_suffix}.png')
+    plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+    tee_print(f"  Saved: {fig_path}")
+    
+    plt.show(block=False)
+    plt.pause(0.1)
+    
+    tee_print(f"\nEstimation Results {stage_name}:")
+    if estimated_dist:
+        tee_print(f"  Estimated distance: {estimated_dist:.2f}°")
+        tee_print(f"  True distance: {DISTANCE_DEG}°")
+        tee_print(f"  Error: {abs(estimated_dist - DISTANCE_DEG):.2f}°")
+    if estimated_depth:
+        tee_print(f"  Estimated depth: {estimated_depth:.1f} km")
+        tee_print(f"  True depth: {SOURCE_DEPTH_KM} km")
+        tee_print(f"  Error: {abs(estimated_depth - SOURCE_DEPTH_KM):.1f} km")
+    tee_print(f"{'='*80}\n")
+    
+    return estimated_dist, estimated_depth, SUMphase, SUMphase_depth, GRID_SEARCH_DISTANCES, GRID_SEARCH_DEPTHS
+
+#=================================================================================================
+# Main Analysis
+#=================================================================================================
+
+def run_stage1_analysis(FILES, EVENT_TIME, STAGE1_PHASES, STAGE1_DISTANCE_RANGE, 
+                        STAGE1_DEPTH_RANGE, PICKER_PERIOD_LOW, PICKER_PERIOD_HIGH,
+                        OUTPUT_DIR, arrivals):
+    """
+    Run Stage 1 initial location estimate with P and S picking (Phase 2 extraction).
+    
+    This function handles:
+    1. Load and filter waveform data
+    2. Determine reference time (EVENT_TIME or trace start)
+    3. Plot three-component waveforms
+    4. Interactive P and S phase picking
+    5. Run broad grid search for distance and depth
+    6. Print Stage 1 results summary
+    
+    Parameters:
+        FILES: List of data files to load
+        EVENT_TIME: Event origin time (UTCDateTime or None for blind mode)
+        STAGE1_PHASES: List of phases to pick (typically ['P', 'S'])
+        STAGE1_DISTANCE_RANGE: [min, max] distance in degrees
+        STAGE1_DEPTH_RANGE: [min, max] depth in km
+        PICKER_PERIOD_LOW, PICKER_PERIOD_HIGH: Bandpass filter periods (seconds)
+        OUTPUT_DIR: Output directory path
+        arrivals: TauP predicted arrivals for plotting
+    
+    Returns:
+        dict: {
+            'stage1_picks': dict,
+            'stage1_distance': float,
+            'stage1_depth': float,
+            'st_pick_filt': ObsPy stream (filtered for Stage 2),
+            'reference_time': UTCDateTime,
+            't': array,
+            'dataE_pick': array,
+            'dataN_pick': array,
+            'dataZ_pick': array,
+            'start': UTCDateTime
+        }
+    """
+    tee_print("\n" + "="*80)
+    tee_print("STAGE 1: INITIAL LOCATION ESTIMATE")
+    tee_print("="*80)
+    tee_print("Strategy: Pick P and S phases only for initial coarse location")
+    tee_print("="*80 + "\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 1: Load and filter data for picking
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    st_pick = load_stream(FILES)
+    
+    # Trim data appropriately based on mode
+    if EVENT_TIME is not None:
+        # Validation mode: trim relative to known event time
+        st_pick = st_pick.trim(EVENT_TIME, EVENT_TIME + 60*60)
+        reference_time = EVENT_TIME
+    else:
+        # Blind mode: use first hour of data from trace start
+        start_time = st_pick[0].stats.starttime
+        st_pick = st_pick.trim(start_time, start_time + 60*60)
+        reference_time = start_time
+    
+    npts = st_pick[0].stats.npts
+    samprate = st_pick[0].stats.sampling_rate
+    t = np.arange(0, npts / samprate, 1 / samprate)
+    start = st_pick[0].stats.starttime
+    diff1 = start - reference_time
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 2: Apply bandpass filter
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    st_pick_filt = st_pick.copy()
+    st_pick_filt.taper(0.1, type='hann', side='both')
+    st_pick_filt.filter('bandpass', freqmin=1/PICKER_PERIOD_HIGH, freqmax=1/PICKER_PERIOD_LOW, 
+                       corners=2, zerophase=False)
+    
+    # Extract components for plotting
+    dataZ_pick = st_pick_filt[1].data
+    dataE_pick = st_pick_filt[0].data
+    dataN_pick = st_pick_filt[2].data
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 3: Plot three-component data before picking
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    title = f'Three-Component Seismogram for Stage 1 Picking | Period: {PICKER_PERIOD_LOW}-{PICKER_PERIOD_HIGH}s'
+    fig, ax = common_utils.plot_three_component_data(
+        t, dataE_pick, dataN_pick, dataZ_pick, arrivals, title,
+        use_utc=True, start_time=start
+    )
+    
+    # Save figure
+    fig_path = os.path.join(OUTPUT_DIR, 'stage1_waveform.png')
+    fig.savefig(fig_path, dpi=150, bbox_inches='tight')
+    tee_print(f"Saved: {fig_path}")
+    
+    plt.show(block=False)
+    plt.pause(0.1)
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 4: Interactive picking - Stage 1
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    stage1_picks = interactive_phase_picking(
+        st_pick_filt, reference_time, STAGE1_PHASES, 
+        STAGE1_DISTANCE_RANGE, STAGE1_DEPTH_RANGE,
+        stage_name="(STAGE 1)"
+    )
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 5: Run grid search with Stage 1 picks
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    stage1_distance = None
+    stage1_depth = None
+    
+    if stage1_picks['P']:
+        stage1_distance, stage1_depth, _, _, _, _ = run_grid_search(
+            stage1_picks, stage_name="(STAGE 1)"
+        )
+        
+        #═════════════════════════════════════════════════════════════════════════════
+        # STEP 6: Print Stage 1 summary
+        #═════════════════════════════════════════════════════════════════════════════
+        
+        tee_print("\n" + "="*80)
+        tee_print("STAGE 1 COMPLETE - BODY WAVE ANALYSIS")
+        tee_print("="*80)
+        if stage1_distance and stage1_depth:
+            tee_print(f"Body Wave Estimated Distance: {stage1_distance:.2f}°")
+            tee_print(f"Body Wave Estimated Depth: {stage1_depth:.1f} km")
+        tee_print("="*80 + "\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 7: Return results dictionary
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    return {
+        'stage1_picks': stage1_picks,
+        'stage1_distance': stage1_distance,
+        'stage1_depth': stage1_depth,
+        'st_pick_filt': st_pick_filt,
+        'reference_time': reference_time,
+        't': t,
+        'dataE_pick': dataE_pick,
+        'dataN_pick': dataN_pick,
+        'dataZ_pick': dataZ_pick,
+        'start': start
+    }
+
+
+def run_rayleigh_and_stockwell_analysis(stage1_distance, FILES, EVENT_TIME, DISTANCE_DEG,
+                                        OUTPUT_DIR, EVENT_NAME):
+    """
+    Run Rayleigh wave analysis (simple + Stockwell) with user prompt (Phase 3 extraction).
+    
+    This function handles:
+    1. User prompt for Rayleigh wave analysis
+    2. Simple Rayleigh wave group velocity analysis (R1/R2/R3)
+    3. Automatic Stockwell transform + orbit detection analysis
+    4. Distance comparison and optional update of stage1_distance
+    5. Extract distance and timing PDFs from orbit detection
+    
+    Parameters:
+        stage1_distance: Stage 1 distance estimate (degrees)
+        FILES: List of data files to load
+        EVENT_TIME: Event origin time (UTCDateTime)
+        DISTANCE_DEG: True distance for validation (degrees)
+        OUTPUT_DIR: Output directory path
+        EVENT_NAME: Event name for file naming
+    
+    Returns:
+        dict or None: {
+            'rayleigh_distance': float,
+            'rayleigh_x': array,
+            'rayleigh_pdf': array,
+            'rayleigh_t0_x': array,
+            'rayleigh_t0_pdf': array,
+            'tr1': ObsPy trace,
+            'band_high': array,
+            'band_low': array,
+            'updated_stage1_distance': float,
+            'stockwell_results': dict,
+            'stockwell_distance_pdf': dict,
+            'stockwell_timing_pdf': dict,
+            'detected_orbits': dict,
+            'st_raw': ObsPy stream (for later use)
+        } or None if user declines
+    """
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 1: User prompt for Rayleigh wave analysis
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    rayleigh_response = input("Would you like to run Rayleigh wave analysis? (y/n): ")
+    
+    if rayleigh_response.lower() not in ['y', 'yes']:
+        return None
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 2: Load raw data and run simple Rayleigh wave analysis
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    # Load raw data for Rayleigh wave analysis
+    st_raw = load_stream(FILES)
+    
+    # Run Rayleigh wave analysis and store PDF arrays (distance and timing)
+    rayleigh_distance, rayleigh_x, rayleigh_pdf, rayleigh_t0_x, rayleigh_t0_pdf, tr1, band_high, band_low = analyze_rayleigh_waves(
+        st_raw=st_raw,
+        reference_time=EVENT_TIME if EVENT_TIME else P_ARRIVAL_TIME,
+        estimated_distance=stage1_distance,
+        p_arrival_time=P_ARRIVAL_TIME,
+        event_time=EVENT_TIME,
+        use_known_origin=USE_KNOWN_ORIGIN,
+        distance_deg=DISTANCE_DEG,
+        band_high=BAND_HIGH,
+        band_low=BAND_LOW,
+        output_dir=OUTPUT_DIR
+    )
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 3: Compare with body wave estimate and optionally update
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    updated_stage1_distance = stage1_distance
+    
+    if rayleigh_distance is not None:
+        tee_print(f"\nDistance estimates comparison:")
+        tee_print(f"  Body waves: {stage1_distance:.2f}°")
+        tee_print(f"  Rayleigh waves: {rayleigh_distance:.2f}°")
+        tee_print(f"  True distance: {DISTANCE_DEG}°")
+        
+        # Optionally use Rayleigh wave distance for Stage 2
+        use_rayleigh = input("\nUse Rayleigh wave distance estimate for Stage 2? (y/n): ")
+        if use_rayleigh.lower() in ['y', 'yes']:
+            updated_stage1_distance = rayleigh_distance
+            tee_print(f"  Using Rayleigh wave distance: {updated_stage1_distance:.2f}°")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 4: AUTOMATIC - Advanced Stockwell + Orbit Detection Analysis
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    tee_print("\n" + "="*80)
+    tee_print("RUNNING ADVANCED STOCKWELL + ORBIT DETECTION ANALYSIS")
+    tee_print("="*80)
+    tee_print("This will provide:")
+    tee_print("  - Multi-band backazimuth estimation (0.01-3 Hz)")
+    tee_print("  - Stockwell filtering with NIP energy masks (50-150s period)")
+    tee_print("  - R1/R2/R3 orbit detection with joint distance fitting")
+    tee_print("  - Distance and timing PDFs from orbit detection")
+    tee_print("="*80 + "\n")
+    
+    # Run Stockwell analysis
+    stockwell_results = analyze_rayleigh_waves_stockwell(
+        st_raw=st_raw,
+        output_dir=OUTPUT_DIR,
+        event_name=EVENT_NAME,
+        catalog_distance_deg=updated_stage1_distance,  # Use best distance estimate
+        use_sac_headers=True
+    )
+    
+    stockwell_distance_pdf = None
+    stockwell_timing_pdf = None
+    detected_orbits = None
+    
+    if stockwell_results:
+        # Extract results
+        stockwell_distance = stockwell_results['distance_deg']
+        stockwell_baz = stockwell_results['baz_deg']
+        stockwell_baz_std = stockwell_results['baz_std']
+        stockwell_reliability = stockwell_results['reliability']
+        detected_orbits = stockwell_results['detected_orbits']
+        
+        tee_print(f"\n{'='*80}")
+        tee_print(f"STOCKWELL ANALYSIS SUMMARY")
+        tee_print(f"{'='*80}")
+        if stockwell_distance:
+            tee_print(f"Distance (joint orbit fit): {stockwell_distance:.2f}°")
+            tee_print(f"  Error from true: {abs(stockwell_distance - DISTANCE_DEG):.2f}°")
+        tee_print(f"Backazimuth: {stockwell_baz:.2f}° ± {stockwell_baz_std:.1f}°")
+        tee_print(f"  Reliability: {stockwell_reliability['baz_reliability']:.3f}")
+        tee_print(f"Orbits detected: {stockwell_reliability['n_orbits_detected']}/3")
+        tee_print(f"{'='*80}\n")
+        
+        #═════════════════════════════════════════════════════════════════════════════
+        # STEP 5: Extract and plot distance/timing PDFs from orbit detection
+        #═════════════════════════════════════════════════════════════════════════════
+        
+        # Calculate event_offset_sec for extract_orbit_pdfs
+        event_offset_sec = float(st_raw[0].stats.starttime - EVENT_TIME) if EVENT_TIME else 0.0
+        
+        # Extract and plot distance/timing PDFs from orbit detection results
+        stockwell_distance_pdf, stockwell_timing_pdf = extract_orbit_pdfs(
+            detected_orbits=detected_orbits,
+            catalog_distance_deg=updated_stage1_distance,
+            event_offset_sec=event_offset_sec,
+            output_dir=OUTPUT_DIR,
+            event_name=EVENT_NAME,
+            use_known_origin=USE_KNOWN_ORIGIN,
+            distance_deg=DISTANCE_DEG
+        )
+    else:
+        tee_print("\nWARNING: Stockwell analysis failed or returned no results.\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 6: Return comprehensive results dictionary
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    return {
+        'rayleigh_distance': rayleigh_distance,
+        'rayleigh_x': rayleigh_x,
+        'rayleigh_pdf': rayleigh_pdf,
+        'rayleigh_t0_x': rayleigh_t0_x,
+        'rayleigh_t0_pdf': rayleigh_t0_pdf,
+        'tr1': tr1,
+        'band_high': band_high,
+        'band_low': band_low,
+        'updated_stage1_distance': updated_stage1_distance,
+        'stockwell_results': stockwell_results,
+        'stockwell_distance_pdf': stockwell_distance_pdf,
+        'stockwell_timing_pdf': stockwell_timing_pdf,
+        'detected_orbits': detected_orbits,
+        'st_raw': st_raw  # Return for later polarization analysis
+    }
+
+
+def run_stage2_analysis(st_pick_filt, reference_time, arrivals, t, dataE_pick, dataN_pick, dataZ_pick,
+                        start, stage1_picks, stage1_distance, stage1_depth,
+                        OUTPUT_DIR, EVENT_NAME, STAGE2_PHASES, STAGE2_DISTANCE_BUFFER, 
+                        STAGE2_DEPTH_BUFFER, STAGE1_DISTANCE_RANGE, STAGE1_DEPTH_RANGE,
+                        GRID_SEARCH_MODELS):
+    """
+    Run Stage 2 refined multi-phase picking and grid search (Phase 4 extraction).
+    
+    This function handles:
+    1. Calculate refined TauP ranges based on Stage 1 results
+    2. Plot waveforms with Stage 1 picks as reference
+    3. Run interactive Stage 2 picking with additional phases
+    4. Run refined grid search centered on Stage 1 estimate
+    5. Calculate body wave timing PDF from phase picks
+    6. Print comparison with Stage 1 results
+    
+    Parameters:
+        st_pick_filt: Filtered ObsPy stream for picking
+        reference_time: Reference time (EVENT_TIME or trace start)
+        arrivals: TauP predicted arrivals for plotting
+        t, dataE_pick, dataN_pick, dataZ_pick: Time and data arrays for plotting
+        start: Trace start time (UTCDateTime)
+        stage1_picks: Stage 1 picks dictionary (for reference plotting)
+        stage1_distance: Stage 1 distance estimate (degrees)
+        stage1_depth: Stage 1 depth estimate (km)
+        OUTPUT_DIR: Output directory path
+        EVENT_NAME: Event name for file naming
+        STAGE2_PHASES: List of phases to pick in Stage 2
+        STAGE2_DISTANCE_BUFFER: ± degrees from Stage 1 estimate
+        STAGE2_DEPTH_BUFFER: ± km from Stage 1 estimate
+        STAGE1_DISTANCE_RANGE: Stage 1 distance range (fallback)
+        STAGE1_DEPTH_RANGE: Stage 1 depth range (fallback)
+        GRID_SEARCH_MODELS: List of Earth models for grid search
+    
+    Returns:
+        dict: {
+            'stage2_picks': dict,
+            'stage2_distance': float,
+            'stage2_depth': float,
+            'stage2_pdf': array,
+            'stage2_distances': array,
+            'stage2_depths': array,
+            'to': array,
+            'PDF_t0': array,
+            'average_t0': float,
+            'std_t0': float
+        }
+    """
+    tee_print("\n" + "="*80)
+    tee_print("STAGE 2: REFINED MULTI-PHASE PICKING")
+    tee_print("="*80)
+    tee_print("Strategy: Pick additional phases with refined TauP predictions")
+    tee_print("="*80 + "\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 1: Calculate refined TauP ranges based on Stage 1 results
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    if stage1_distance:
+        stage2_distance_range = [
+            max(STAGE1_DISTANCE_RANGE[0], stage1_distance - STAGE2_DISTANCE_BUFFER),
+            min(STAGE1_DISTANCE_RANGE[1], stage1_distance + STAGE2_DISTANCE_BUFFER)
+        ]
+    else:
+        stage2_distance_range = STAGE1_DISTANCE_RANGE
+    
+    if stage1_depth:
+        stage2_depth_range = [
+            max(STAGE1_DEPTH_RANGE[0], stage1_depth - STAGE2_DEPTH_BUFFER),
+            min(STAGE1_DEPTH_RANGE[1], stage1_depth + STAGE2_DEPTH_BUFFER)
+        ]
+    else:
+        stage2_depth_range = STAGE1_DEPTH_RANGE
+    
+    tee_print(f"Refined TauP ranges based on Stage 1:")
+    tee_print(f"  Distance: {stage2_distance_range[0]:.1f}-{stage2_distance_range[1]:.1f}°")
+    tee_print(f"  Depth: {stage2_depth_range[0]:.1f}-{stage2_depth_range[1]:.1f} km\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 2: Plot waveforms with Stage 1 picks as reference
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    title = f'Three-Component Seismogram for Stage 2 Picking (Stage 1 picks shown with dotted lines)'
+    fig, ax = common_utils.plot_three_component_data(
+        t, dataE_pick, dataN_pick, dataZ_pick, arrivals, title,
+        stage1_picks=stage1_picks,
+        use_utc=True, start_time=start, reference_time=reference_time
+    )
+    
+    # Save figure
+    fig_path = os.path.join(OUTPUT_DIR, 'stage2_waveform.png')
+    fig.savefig(fig_path, dpi=150, bbox_inches='tight')
+    tee_print(f"Saved: {fig_path}")
+    
+    plt.show(block=False)
+    plt.pause(0.1)
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 3: Interactive picking - Stage 2
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    stage2_picks = interactive_phase_picking(
+        st_pick_filt, reference_time, STAGE2_PHASES,
+        stage2_distance_range, stage2_depth_range,
+        stage_name="(STAGE 2)",
+        stage1_picks=stage1_picks
+    )
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 4: Run refined grid search with Stage 2 picks
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    if not stage2_picks.get('P'):
+        tee_print("ERROR: No P picks in Stage 2. Cannot run grid search.")
+        return None
+    
+    stage2_distance, stage2_depth, stage2_pdf, _, stage2_distances, stage2_depths = run_grid_search(
+        stage2_picks, 
+        stage_name="(STAGE 2)",
+        stage=2,
+        prev_distance=stage1_distance,
+        prev_depth=stage1_depth
+    )
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 5: Calculate body wave timing PDF from phase picks
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    # Initialize t0_body as empty list to collect origin time estimates
+    t0_body = []
+    
+    for k, model_name in enumerate(GRID_SEARCH_MODELS):
+        model_grid = TauPyModel(model=model_name)
+        
+        arrivals_grid = model_grid.get_travel_times(
+            source_depth_in_km=stage2_depth,
+            distance_in_degree=stage2_distance,
+            phase_list=["P", "PP", "S", "PS"]
+        )
+        
+        if len(arrivals_grid) >= 4:
+            predP = arrivals_grid[0].time
+            predPP = arrivals_grid[1].time
+            predS = arrivals_grid[2].time
+            predPS = arrivals_grid[3].time
+            
+            # Calculate origin time estimates for each phase
+            # stage2_picks are lists, so use [0] to get first pick
+            if stage2_picks.get('P') and len(stage2_picks['P']) > 0:
+                t0_body.append(stage2_picks['P'][0] - predP)
+            if stage2_picks.get('PP') and len(stage2_picks['PP']) > 0:
+                t0_body.append(stage2_picks['PP'][0] - predPP)
+            if stage2_picks.get('S') and len(stage2_picks['S']) > 0:
+                t0_body.append(stage2_picks['S'][0] - predS)
+            if stage2_picks.get('PS') and len(stage2_picks['PS']) > 0:
+                t0_body.append(stage2_picks['PS'][0] - predPS)
+    
+    # Calculate statistics from all t0 estimates
+    average_t0 = np.mean(t0_body) if len(t0_body) > 0 else None
+    std_t0 = np.std(t0_body) if len(t0_body) > 0 else None
+    
+    # Create timing PDF
+    to = None
+    PDF_t0 = None
+    if average_t0 is not None and std_t0 is not None and std_t0 > 0:
+        to = np.arange(average_t0 - 3*std_t0, average_t0 + 3*std_t0, std_t0/10)
+        PDF_t0 = 1/(std_t0*math.sqrt(2*math.pi)) * np.exp(-0.5*((to - average_t0)/std_t0)**2)
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 6: Print summary and comparison
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    tee_print("\n" + "="*80)
+    tee_print("STAGE 2 COMPLETE - BODY WAVE ANALYSIS")
+    tee_print("="*80)
+    if stage2_distance and stage2_depth:
+        tee_print(f"Body Wave Estimated Distance: {stage2_distance:.2f}°")
+        tee_print(f"Body Wave Estimated Depth: {stage2_depth:.1f} km")
+        
+        if stage1_distance and stage1_depth:
+            tee_print(f"\nImprovement from Stage 1:")
+            tee_print(f"  Distance change: {abs(stage2_distance - stage1_distance):.2f}°")
+            tee_print(f"  Depth change: {abs(stage2_depth - stage1_depth):.1f} km")
+    
+    if average_t0 is not None:
+        tee_print(f"\nOrigin Time Estimate:")
+        tee_print(f"  Average: {average_t0:.1f}s (±{std_t0:.1f}s)")
+    
+    tee_print("="*80 + "\n")
+    
+    # Return results dictionary
+    return {
+        'stage2_picks': stage2_picks,
+        'stage2_distance': stage2_distance,
+        'stage2_depth': stage2_depth,
+        'stage2_pdf': stage2_pdf,
+        'stage2_distances': stage2_distances,
+        'stage2_depths': stage2_depths,
+        'to': to,
+        'PDF_t0': PDF_t0,
+        'average_t0': average_t0,
+        'std_t0': std_t0
+    }
+
+
+def combine_and_export_results(rayleigh_distance=None, rayleigh_x=None, rayleigh_pdf=None,
+                                rayleigh_t0_x=None, rayleigh_t0_pdf=None,
+                                stage2_distance=None, stage2_distances=None, stage2_pdf=None,
+                                stage2_depth=None, stage2_depths=None,
+                                to=None, PDF_t0=None, average_t0=None, std_t0=None,
+                                stage2_picks=None, tr1=None, band_high=None, band_low=None,
+                                stockwell_results=None, stockwell_distance_pdf=None, 
+                                stockwell_timing_pdf=None, detected_orbits=None,
+                                OUTPUT_DIR=None, EVENT_NAME=None, STATION_NAME=None,
+                                P_ARRIVAL_TIME=None, EVENT_TIME=None, USE_KNOWN_ORIGIN=None,
+                                DISTANCE_DEG=None):
+    """
+    Combine PDFs and export comprehensive results (Phase 5 extraction).
+    
+    This function handles:
+    1. Combining Rayleigh + body wave distance PDFs
+    2. Combining Rayleigh + body wave timing PDFs  
+    3. Exporting comprehensive pickle file with all results
+    4. Plotting combined PDFs
+    
+    Parameters:
+        rayleigh_distance: Rayleigh wave distance estimate (degrees)
+        rayleigh_x, rayleigh_pdf: Rayleigh distance PDF arrays
+        rayleigh_t0_x, rayleigh_t0_pdf: Rayleigh timing PDF arrays
+        stage2_distance: Body wave distance estimate (degrees)
+        stage2_distances, stage2_pdf: Body wave distance PDF arrays
+        stage2_depth: Body wave depth estimate (km)
+        stage2_depths: Body wave depth grid
+        to, PDF_t0: Body wave timing PDF arrays
+        average_t0, std_t0: Body wave timing statistics
+        stage2_picks: Stage 2 picks dictionary
+        tr1, band_high, band_low: Rayleigh wave analysis metadata
+        stockwell_results: Stockwell analysis results dict
+        stockwell_distance_pdf, stockwell_timing_pdf: Stockwell PDF dicts
+        detected_orbits: Orbit detection results
+        OUTPUT_DIR, EVENT_NAME, STATION_NAME: Output file paths
+        P_ARRIVAL_TIME, EVENT_TIME, USE_KNOWN_ORIGIN: Time reference info
+        DISTANCE_DEG: True distance for validation
+    
+    Returns:
+        dict: {
+            'combined_distance': float,
+            'combined_distance_std': float,
+            'combined_distance_x': array,
+            'combined_distance_pdf': array,
+            'combined_t0': float,
+            'combined_t0_std': float,
+            'combined_t0_x': array,
+            'combined_t0_pdf': array,
+            'pickle_path': str
+        }
+    """
+    results = {
+        'combined_distance': None,
+        'combined_distance_std': None,
+        'combined_distance_x': None,
+        'combined_distance_pdf': None,
+        'combined_t0': None,
+        'combined_t0_std': None,
+        'combined_t0_x': None,
+        'combined_t0_pdf': None,
+        'pickle_path': None
+    }
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 1: Combine Distance PDFs (if both Rayleigh and body wave available)
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    if rayleigh_distance is not None and rayleigh_x is not None and rayleigh_pdf is not None:
+        if stage2_distance and stage2_distances is not None and stage2_pdf is not None:
+            # Combine Rayleigh wave and body wave distance PDFs
+            x_combined, pdf_combined, combined_distance, combined_std = combine_distance_pdfs(
+                rayleigh_x, rayleigh_pdf,
+                stage2_distances, stage2_pdf,
+                DISTANCE_DEG if DISTANCE_DEG else 90.0,
+                label1="Rayleigh Waves",
+                label2="Body Waves (Stage 2)"
+            )
+            
+            results['combined_distance'] = combined_distance
+            results['combined_distance_std'] = combined_std
+            results['combined_distance_x'] = x_combined
+            results['combined_distance_pdf'] = pdf_combined
+            
+            # Plot combined PDF comparison
+            fig, ax = plt.subplots(figsize=(8, 5))
+            
+            # Plot individual PDFs
+            ax.plot(rayleigh_x, rayleigh_pdf, 'b-', linewidth=1.2, 
+                   label='Rayleigh Wave PDF', alpha=0.7)
+            ax.plot(stage2_distances, stage2_pdf, 'g-', linewidth=1.2, 
+                   label='Body Wave PDF (Stage 2)', alpha=0.7)
+            
+            # Plot combined PDF
+            ax.fill_between(x_combined, pdf_combined, alpha=0.3, color='red')
+            ax.plot(x_combined, pdf_combined, 'r-', linewidth=1.5, 
+                   label='Combined PDF', zorder=10)
+            
+            # Mark true distance if known
+            if DISTANCE_DEG:
+                ax.axvline(DISTANCE_DEG, color='black', linestyle='-',
+                          linewidth=0.8, label=f'True distance: {DISTANCE_DEG}°',
+                          alpha=0.8, zorder=5)
+            
+            # Mark individual estimates
+            if rayleigh_distance:
+                ax.axvline(rayleigh_distance, color='b', linestyle='-',
+                          linewidth=0.8, alpha=0.6)
+            if stage2_distance:
+                ax.axvline(stage2_distance, color='g', linestyle='-',
+                          linewidth=0.8, alpha=0.6)
+            
+            # Mark combined estimate
+            if combined_distance:
+                max_idx = np.argmax(pdf_combined)
+                ax.plot(combined_distance, pdf_combined[max_idx], 'r*', 
+                       markersize=15, label=f'Combined: {combined_distance:.2f}°', 
+                       zorder=20)
+            
+            ax.set_xlabel('Distance (degrees)', fontweight='bold', fontsize=10)
+            ax.set_ylabel('Probability Density', fontweight='bold', fontsize=10)
+            ax.set_title('Combined Distance Estimation: Rayleigh + Body Waves (Stage 2)', 
+                        fontweight='bold', fontsize=11)
+            ax.legend(fontsize=9, loc='best')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            # Save figure
+            fig_path = os.path.join(OUTPUT_DIR, 'combined_distance_pdf_stage2.png')
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            tee_print(f"Saved: {fig_path}")
+            
+            plt.show(block=False)
+            plt.pause(0.1)
+            
+            # Print summary
+            tee_print("\n" + "="*80)
+            tee_print("FINAL COMBINED DISTANCE ESTIMATE")
+            tee_print("="*80)
+            tee_print(f"Rayleigh wave estimate: {rayleigh_distance:.2f}°")
+            tee_print(f"Body wave estimate (Stage 2): {stage2_distance:.2f}°")
+            tee_print(f"COMBINED FINAL ESTIMATE: {combined_distance:.2f}° (±{combined_std:.2f}°)")
+            if DISTANCE_DEG:
+                tee_print(f"True distance: {DISTANCE_DEG}°")
+                tee_print(f"Final error: {abs(combined_distance - DISTANCE_DEG):.2f}°")
+            tee_print("="*80 + "\n")
+        else:
+            tee_print("\nNote: Body wave distance PDF not available. Using Rayleigh estimate only.\n")
+            results['combined_distance'] = rayleigh_distance
+            results['combined_distance_x'] = rayleigh_x
+            results['combined_distance_pdf'] = rayleigh_pdf
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 2: Combine Timing PDFs (if both available)
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    if rayleigh_t0_x is not None and rayleigh_t0_pdf is not None:
+        if to is not None and PDF_t0 is not None:
+            # Combine Rayleigh wave and body wave timing PDFs
+            t0_combined_x, t0_combined_pdf, t0_combined_estimate, t0_combined_std = combine_distance_pdfs(
+                rayleigh_t0_x, rayleigh_t0_pdf,
+                to, PDF_t0,
+                0.0,  # True origin time offset is 0
+                label1="Rayleigh Waves",
+                label2="Body Waves (Stage 2)"
+            )
+            
+            results['combined_t0'] = t0_combined_estimate
+            results['combined_t0_std'] = t0_combined_std
+            results['combined_t0_x'] = t0_combined_x
+            results['combined_t0_pdf'] = t0_combined_pdf
+            
+            # Plot combined timing PDF with UTC time
+            from matplotlib.dates import DateFormatter, SecondLocator
+            import matplotlib.dates as mdates
+            
+            fig, ax = plt.subplots(figsize=(8, 5))
+            
+            # Determine reference time
+            reference_time_utc = EVENT_TIME if EVENT_TIME is not None else P_ARRIVAL_TIME
+            
+            if reference_time_utc is not None:
+                # Convert to UTC
+                rayleigh_t0_utc = [reference_time_utc + t for t in rayleigh_t0_x]
+                body_t0_utc = [reference_time_utc + t for t in to]
+                combined_t0_utc = [reference_time_utc + t for t in t0_combined_x]
+                
+                rayleigh_t0_plot = mdates.date2num(rayleigh_t0_utc)
+                body_t0_plot = mdates.date2num(body_t0_utc)
+                combined_t0_plot = mdates.date2num(combined_t0_utc)
+                
+                # Plot
+                ax.plot(rayleigh_t0_plot, rayleigh_t0_pdf, 'b-', linewidth=1.2, 
+                       label='Rayleigh Wave PDF', alpha=0.7)
+                ax.plot(body_t0_plot, PDF_t0, 'g-', linewidth=1.2, 
+                       label='Body Wave PDF (Stage 2)', alpha=0.7)
+                ax.fill_between(combined_t0_plot, t0_combined_pdf, alpha=0.3, color='red')
+                ax.plot(combined_t0_plot, t0_combined_pdf, 'r-', linewidth=1.5, 
+                       label='Combined PDF', zorder=10)
+                
+                # Mark true origin if known
+                if USE_KNOWN_ORIGIN and EVENT_TIME is not None:
+                    true_origin_plot = mdates.date2num(EVENT_TIME)
+                    ax.axvline(true_origin_plot, color='black', linestyle='-',
+                              linewidth=0.8, label=f'True: {EVENT_TIME.strftime("%H:%M:%S")}',
+                              alpha=0.8, zorder=5)
+                
+                # Mark estimates
+                rayleigh_t0_estimate_utc = reference_time_utc + rayleigh_t0_x[np.argmax(rayleigh_t0_pdf)]
+                body_t0_estimate_utc = reference_time_utc + to[np.argmax(PDF_t0)]
+                
+                ax.axvline(mdates.date2num(rayleigh_t0_estimate_utc), color='b', linestyle='-',
+                          linewidth=0.8, alpha=0.6)
+                ax.axvline(mdates.date2num(body_t0_estimate_utc), color='g', linestyle='-',
+                          linewidth=0.8, alpha=0.6)
+                
+                # Mark combined
+                if t0_combined_estimate is not None:
+                    max_idx_t0 = np.argmax(t0_combined_pdf)
+                    combined_estimate_utc = reference_time_utc + t0_combined_estimate
+                    ax.plot(mdates.date2num(combined_estimate_utc), t0_combined_pdf[max_idx_t0], 'r*', 
+                           markersize=15, label=f'Combined: {combined_estimate_utc.strftime("%H:%M:%S")}', 
+                           zorder=20)
+                
+                ax.xaxis.set_major_formatter(DateFormatter('%H:%M:%S'))
+                ax.xaxis.set_major_locator(SecondLocator(interval=120))
+                plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+                ax.set_xlabel('Origin Time (UTC, HH:MM:SS)', fontweight='bold', fontsize=10)
+            else:
+                # Fallback
+                ax.plot(rayleigh_t0_x, rayleigh_t0_pdf, 'b-', linewidth=1.2, label='Rayleigh', alpha=0.7)
+                ax.plot(to, PDF_t0, 'g-', linewidth=1.2, label='Body Wave', alpha=0.7)
+                ax.fill_between(t0_combined_x, t0_combined_pdf, alpha=0.3, color='red')
+                ax.plot(t0_combined_x, t0_combined_pdf, 'r-', linewidth=1.5, label='Combined', zorder=10)
+                ax.set_xlabel('Time before P-arrival (s)', fontweight='bold', fontsize=10)
+            
+            ax.set_ylabel('Probability Density', fontweight='bold', fontsize=10)
+            ax.set_title('Combined Origin Time PDF: Rayleigh + Body Waves', fontweight='bold', fontsize=11)
+            ax.legend(fontsize=9, loc='best')
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            
+            fig_path = os.path.join(OUTPUT_DIR, 'combined_timing_pdf_stage2.png')
+            plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+            tee_print(f"Saved: {fig_path}")
+            
+            plt.show(block=False)
+            plt.pause(0.1)
+            
+            # Print summary
+            rayleigh_t0_estimate = rayleigh_t0_x[np.argmax(rayleigh_t0_pdf)]
+            body_t0_estimate = to[np.argmax(PDF_t0)]
+            
+            tee_print("\n" + "="*80)
+            tee_print("FINAL COMBINED ORIGIN TIME ESTIMATE")
+            tee_print("="*80)
+            tee_print(f"Rayleigh wave estimate: {rayleigh_t0_estimate:.1f}s")
+            tee_print(f"Body wave estimate (Stage 2): {body_t0_estimate:.1f}s")
+            tee_print(f"COMBINED FINAL ESTIMATE: {t0_combined_estimate:.1f}s (±{t0_combined_std:.1f}s)")
+            tee_print(f"True origin time offset: 0.0s")
+            tee_print(f"Final error: {abs(t0_combined_estimate):.1f}s")
+            tee_print("="*80 + "\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 3: Export comprehensive pickle file
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    tee_print("Exporting comprehensive analysis results for Monte Carlo sampling...")
+    import pickle
+    
+    # Calculate origin time in UTC
+    origin_time_utc = None
+    origin_offset_sec = None
+    if P_ARRIVAL_TIME is not None:
+        if results['combined_t0'] is not None:
+            origin_offset_sec = results['combined_t0']
+            origin_time_utc = P_ARRIVAL_TIME + origin_offset_sec
+        elif average_t0 is not None:
+            origin_offset_sec = average_t0
+            origin_time_utc = P_ARRIVAL_TIME + origin_offset_sec
+    
+    # Build comprehensive dictionary
+    comprehensive_results = {
+        'picks_utc': stage2_picks if stage2_picks else {},
+        'picks_relative': {
+            phase: [float(p - P_ARRIVAL_TIME) for p in times] if P_ARRIVAL_TIME and times else []
+            for phase, times in (stage2_picks or {}).items()
+        },
+        'body_wave': {
+            'distance_deg': stage2_distance,
+            'depth_km': stage2_depth,
+            'distance_pdf_x': stage2_distances if stage2_distances is not None else np.array([]),
+            'distance_pdf_y': stage2_pdf if stage2_pdf is not None else np.array([]),
+            'depth_pdf_x': stage2_depths if stage2_depths is not None else np.array([]),
+            'depth_pdf_y': None,
+            'timing_pdf_x': to if to is not None else np.array([]),
+            'timing_pdf_y': PDF_t0 if PDF_t0 is not None else np.array([]),
+            'timing_estimate': average_t0,
+            'timing_std': std_t0
+        },
+        'rayleigh_wave': {
+            'distance_deg': rayleigh_distance,
+            'distance_pdf_x': rayleigh_x if rayleigh_x is not None else np.array([]),
+            'distance_pdf_y': rayleigh_pdf if rayleigh_pdf is not None else np.array([]),
+            'timing_pdf_x': rayleigh_t0_x if rayleigh_t0_x is not None else np.array([]),
+            'timing_pdf_y': rayleigh_t0_pdf if rayleigh_t0_pdf is not None else np.array([]),
+            'r1_arrival_utc': None,  # Could extract from tr1 if needed
+            'band_high': band_high,
+            'band_low': band_low
+        },
+        'stockwell': {
+            'distance_deg': stockwell_results.get('distance_deg') if stockwell_results else None,
+            'distance_pdf_x': stockwell_distance_pdf.get('x') if stockwell_distance_pdf else np.array([]),
+            'distance_pdf_y': stockwell_distance_pdf.get('pdf') if stockwell_distance_pdf else np.array([]),
+            'timing_pdf_x': stockwell_timing_pdf.get('x') if stockwell_timing_pdf else np.array([]),
+            'timing_pdf_y': stockwell_timing_pdf.get('pdf') if stockwell_timing_pdf else np.array([]),
+            'detected_orbits': detected_orbits
+        },
+        'combined': {
+            'distance_pdf_x': results['combined_distance_x'],
+            'distance_pdf_y': results['combined_distance_pdf'],
+            'distance_estimate': results['combined_distance'],
+            'distance_std': results['combined_distance_std'],
+            'timing_pdf_x': results['combined_t0_x'],
+            'timing_pdf_y': results['combined_t0_pdf'],
+            'timing_estimate': results['combined_t0'],
+            'timing_std': results['combined_t0_std'],
+            'source': 'combined_rayleigh_body'
+        },
+        'metadata': {
+            'station': STATION_NAME,
+            'event_name': EVENT_NAME,
+            'p_arrival_time_utc': P_ARRIVAL_TIME,
+            'event_time_utc': EVENT_TIME,
+            'use_known_origin': USE_KNOWN_ORIGIN,
+            'output_dir': OUTPUT_DIR,
+            'analysis_timestamp': datetime.now(),
+            'code_version': '4.1',
+            'notes': 'Comprehensive analysis results with full PDF arrays for Monte Carlo sampling'
+        }
+    }
+    
+    # Save pickle
+    pickle_path = os.path.join(OUTPUT_DIR, f'{EVENT_NAME}_comprehensive_results.pkl')
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(comprehensive_results, f)
+    
+    results['pickle_path'] = pickle_path
+    
+    tee_print(f"\n{'='*80}")
+    tee_print(f"COMPREHENSIVE RESULTS EXPORTED")
+    tee_print(f"{'='*80}")
+    tee_print(f"Pickle file saved: {pickle_path}")
+    tee_print(f"\nContents:")
+    tee_print(f"  ✓ Stage 2 picks (UTC and relative time)")
+    tee_print(f"  ✓ Body wave distance PDF: {len(comprehensive_results['body_wave']['distance_pdf_x'])} points")
+    tee_print(f"  ✓ Rayleigh wave distance PDF: {len(comprehensive_results['rayleigh_wave']['distance_pdf_x'])} points")
+    if results['combined_distance_x'] is not None:
+        tee_print(f"  ✓ Combined distance PDF: {len(results['combined_distance_x'])} points")
+    tee_print(f"  ✓ Metadata (station, times, references)")
+    tee_print(f"\nP-arrival reference: {P_ARRIVAL_TIME}")
+    if origin_time_utc:
+        tee_print(f"Estimated origin: {origin_time_utc} (±{results['combined_t0_std'] or std_t0:.1f}s)")
+    tee_print(f"{'='*80}\n")
+    
+    return results
+
+
+# NOTE: run_polarization_baz_analysis() is now imported from backazimuth.py
+
+def print_final_comprehensive_summary(combined_distance=None, combined_std=None,
+                                     stage2_distance=None, stage2_depth=None,
+                                     t0_combined_estimate=None, t0_combined_std=None,
+                                     average_t0=None, baz_p=None, error_p=None,
+                                     baz_pfroms=None, error_pfroms=None,
+                                     baz_combined=None, baz_combined_std=None):
+    """
+    Print comprehensive final summary of all analysis results.
+    
+    Parameters:
+        combined_distance: Combined distance estimate (degrees)
+        combined_std: Combined distance uncertainty (degrees)
+        stage2_distance: Stage 2 distance estimate (degrees)
+        stage2_depth: Estimated depth (km)
+        t0_combined_estimate: Combined origin time estimate (seconds)
+        t0_combined_std: Combined origin time uncertainty (seconds)
+        average_t0: Body wave origin time estimate (seconds)
+        baz_p: P-wave backazimuth (degrees)
+        error_p: P-wave BAZ error range [lower, upper]
+        baz_pfroms: P-from-S backazimuth (degrees)
+        error_pfroms: P-from-S BAZ error range [lower, upper]
+        baz_combined: Combined backazimuth (degrees)
+        baz_combined_std: Combined BAZ uncertainty (degrees)
+    """
+    tee_print("\n" + "="*80)
+    tee_print("FINAL RESULTS SUMMARY (WITH BACKAZIMUTH)")
+    tee_print("="*80)
+    
+    # Distance
+    if combined_distance and combined_std:
+        tee_print(f"Distance: {combined_distance:.2f}° (±{combined_std:.2f}°)")
+    elif stage2_distance:
+        tee_print(f"Distance: {stage2_distance:.2f}°")
+    
+    # Depth
+    if stage2_depth:
+        tee_print(f"Depth: {stage2_depth:.1f} km")
+    
+    # Origin Time
+    if t0_combined_estimate is not None and t0_combined_std:
+        tee_print(f"Origin Time: {t0_combined_estimate:.1f}s (±{t0_combined_std:.1f}s)")
+    elif average_t0:
+        tee_print(f"Origin Time: {average_t0:.1f}s")
+    
+    # Backazimuth - P-wave
+    if baz_p is not None:
+        tee_print(f"P-wave Backazimuth: {baz_p:.1f}° [{error_p[0]:.1f}°, {error_p[1]:.1f}°]")
+    
+    # Backazimuth - P-from-S
+    if baz_pfroms is not None:
+        tee_print(f"P-from-S Backazimuth: {baz_pfroms:.1f}° [{error_pfroms[0]:.1f}°, {error_pfroms[1]:.1f}°]")
+    
+    # Backazimuth - Combined
+    if baz_combined is not None and baz_combined_std is not None:
+        tee_print(f"Combined Backazimuth: {baz_combined:.1f}° (±{baz_combined_std:.1f}°)")
+    
+    tee_print("="*80 + "\n")
+
+
+def setup_analysis(FILES, EVENT_TIME, SOURCE_DEPTH_KM, DISTANCE_DEG, DATA_DIR,
+                   USE_INTERACTIVE_PICKING):
+    """
+    Initialize analysis: validate files, create output directory, print configuration (Phase 1 extraction).
+    
+    This function handles all initial setup before the main analysis workflow begins:
+    1. Validate that all data files exist
+    2. Extract station name and event time from data
+    3. Create output directory with timestamp
+    4. Print analysis configuration summary
+    5. Calculate TauP predicted arrivals for plotting
+    
+    Parameters:
+        FILES: List of data file names to process
+        EVENT_TIME: Known origin time (UTCDateTime) or None for blind analysis
+        SOURCE_DEPTH_KM: True source depth in km (for validation mode)
+        DISTANCE_DEG: True epicentral distance in degrees (for validation mode)
+        DATA_DIR: Directory path containing data files
+        USE_INTERACTIVE_PICKING: Bool, True for interactive GUI picking
+    
+    Returns:
+        dict or None: {
+            'station_name': str,
+            'event_name': str,
+            'output_dir': str,
+            'arrivals': TauP arrivals object
+        } or None if setup fails
+    """
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 1: Validate data files exist
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    if not check_files_exist():
+        tee_print("ERROR: Data file validation failed. Exiting.")
+        return None
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 2: Extract station name and event time from waveform data
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    st_temp = load_stream(FILES)
+    waveform_start_utc = st_temp[0].stats.starttime
+    station_name = st_temp[0].stats.station
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 3: Set global variables and create output directory
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    global STATION_NAME, EVENT_NAME, OUTPUT_DIR
+    STATION_NAME = station_name
+    EVENT_NAME = waveform_start_utc.strftime("%Y%m%d_%H%M%S")
+    # Use absolute path to ensure Results folder is created inside FullMethod_KnownLocation
+    # Go up one level from sparse_data_analysis/ to FullMethod_KnownLocation/
+    OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+                              f"Results_{STATION_NAME}_{EVENT_NAME}")
+    
+    # Create output directory and initialize log file
+    create_output_directory()
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 4: Print analysis configuration summary
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    tee_print("="*80)
+    tee_print("RAYLEIGH WAVE ANALYSIS - Two-Stage Interactive Picking")
+    tee_print("="*80)
+    tee_print(f"Station: {STATION_NAME}")
+    tee_print(f"Event name: {EVENT_NAME}")
+    tee_print(f"Event time: {EVENT_TIME if EVENT_TIME else 'Unknown (blind mode)'}")
+    if EVENT_TIME:
+        tee_print(f"Source depth: {SOURCE_DEPTH_KM} km")
+        tee_print(f"True distance: {DISTANCE_DEG}°")
+    tee_print(f"Data directory: {DATA_DIR}")
+    tee_print(f"Output directory: {OUTPUT_DIR}")
+    tee_print(f"Interactive picking: {'ENABLED' if USE_INTERACTIVE_PICKING else 'DISABLED (using STA/LTA)'}")
+    tee_print("="*80)
+    
+    # Print frequency band configuration
+    common_utils.print_frequency_band_info(
+        USE_AUTO_BANDS, NUM_BANDS, PERIOD_MIN, PERIOD_MAX,
+        OVERLAP_PERCENT, BAND_HIGH, BAND_LOW
+    )
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 5: Calculate TauP predicted arrivals for plotting reference
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    arrivals = None
+    if EVENT_TIME and SOURCE_DEPTH_KM and DISTANCE_DEG:
+        try:
+            model = TauPyModel(model="iasp91")
+            arrivals = model.get_travel_times(
+                source_depth_in_km=SOURCE_DEPTH_KM,
+                distance_in_degree=DISTANCE_DEG,
+                phase_list=["P", "PP", "S", "PS"]
+            )
+            tee_print(f"\nTauP predicted arrivals calculated (iasp91 model)")
+        except Exception as e:
+            tee_print(f"\nWARNING: Could not calculate TauP arrivals: {e}")
+            arrivals = None
+    else:
+        tee_print(f"\nBlind mode: TauP arrivals not calculated (will use picker estimates)")
+    
+    tee_print("="*80 + "\n")
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # STEP 6: Return setup results
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    return {
+        'station_name': STATION_NAME,
+        'event_name': EVENT_NAME,
+        'output_dir': OUTPUT_DIR,
+        'arrivals': arrivals
+    }
+
+
+def main():
+    """Main analysis workflow with two-stage interactive picking."""
+    
+    #═════════════════════════════════════════════════════════════════════════════════
+    # PARSE COMMAND-LINE ARGUMENTS AND LOAD PAR_FILE
+    #═════════════════════════════════════════════════════════════════════════════════
+    
+    parser = argparse.ArgumentParser(
+        description='Sparse Data Location Analysis - Two-Stage Interactive Seismic Event Analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Run with Peru event parameters
+  python sparse_data_location_analysis.py --par_file par_files/PAR_FILE_Peru.py
+  
+  # Run with another event
+  python sparse_data_location_analysis.py --par_file par_files/PAR_FILE_Alaska.py
+  
+  # Show available parameter files
+  ls par_files/PAR_FILE_*.py
+        '''
+    )
+    
+    parser.add_argument(
+        '--par_file',
+        type=str,
+        required=True,
+        help='Path to parameter file (e.g., par_files/PAR_FILE_Peru.py)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Load parameter file dynamically
+    try:
+        par = load_par_file(args.par_file)
+    except Exception as e:
+        print(f"ERROR: Failed to load parameter file: {e}")
+        return
+    
+    # Extract all parameters from PAR_FILE
+    # File and data configuration
+    global DATA_DIR, FILES, SCRIPT_DIR
+    DATA_DIR = par.DATA_DIR
+    FILES = par.FILES
+    SCRIPT_DIR = par.SCRIPT_DIR
+    
+    # Event parameters
+    global EVENT_TIME, USE_KNOWN_ORIGIN, SOURCE_DEPTH_KM, DISTANCE_DEG, P_ARRIVAL_TIME
+    global STATION_NAME, EVENT_NAME, OUTPUT_DIR
+    EVENT_TIME = par.EVENT_TIME
+    USE_KNOWN_ORIGIN = (EVENT_TIME is not None)
+    SOURCE_DEPTH_KM = par.SOURCE_DEPTH_KM
+    DISTANCE_DEG = par.DISTANCE_DEG
+    P_ARRIVAL_TIME = None  # Will be set during Stage 1 picking
+    STATION_NAME = None    # Will be set from data
+    EVENT_NAME = None      # Will be set from data
+    OUTPUT_DIR = None      # Will be set in setup
+    
+    # Picking configuration
+    global USE_INTERACTIVE_PICKING, STAGE1_PHASES, STAGE1_DISTANCE_RANGE, STAGE1_DEPTH_RANGE
+    global STAGE2_PHASES, STAGE2_DISTANCE_BUFFER, STAGE2_DEPTH_BUFFER
+    global PICKER_PERIOD_HIGH, PICKER_PERIOD_LOW
+    USE_INTERACTIVE_PICKING = par.USE_INTERACTIVE_PICKING
+    STAGE1_PHASES = par.STAGE1_PHASES
+    STAGE1_DISTANCE_RANGE = par.STAGE1_DISTANCE_RANGE
+    STAGE1_DEPTH_RANGE = par.STAGE1_DEPTH_RANGE
+    STAGE2_PHASES = par.STAGE2_PHASES
+    STAGE2_DISTANCE_BUFFER = par.STAGE2_DISTANCE_BUFFER
+    STAGE2_DEPTH_BUFFER = par.STAGE2_DEPTH_BUFFER
+    PICKER_PERIOD_HIGH = par.PICKER_PERIOD_HIGH
+    PICKER_PERIOD_LOW = par.PICKER_PERIOD_LOW
+    
+    # Grid search configuration
+    global ENABLE_GRID_SEARCH, STAGE1_GRID_DEPTHS, STAGE1_GRID_DISTANCES
+    global STAGE2_DISTANCE_SPACING, STAGE2_DEPTH_SPACING, GRID_SEARCH_MODELS
+    global PICK_UNCERTAINTY_P, PICK_UNCERTAINTY_PP, PICK_UNCERTAINTY_S, PICK_UNCERTAINTY_PS
+    ENABLE_GRID_SEARCH = par.ENABLE_GRID_SEARCH
+    STAGE1_GRID_DEPTHS = par.STAGE1_GRID_DEPTHS
+    STAGE1_GRID_DISTANCES = par.STAGE1_GRID_DISTANCES
+    STAGE2_DISTANCE_SPACING = par.STAGE2_DISTANCE_SPACING
+    STAGE2_DEPTH_SPACING = par.STAGE2_DEPTH_SPACING
+    GRID_SEARCH_MODELS = par.GRID_SEARCH_MODELS
+    PICK_UNCERTAINTY_P = par.PICK_UNCERTAINTY_P
+    PICK_UNCERTAINTY_PP = par.PICK_UNCERTAINTY_PP
+    PICK_UNCERTAINTY_S = par.PICK_UNCERTAINTY_S
+    PICK_UNCERTAINTY_PS = par.PICK_UNCERTAINTY_PS
+    
+    # Polarization analysis configuration
+    global ENABLE_POLARIZATION_ANALYSIS, POLARIZATION_PARAMS
+    ENABLE_POLARIZATION_ANALYSIS = par.ENABLE_POLARIZATION_ANALYSIS
+    POLARIZATION_PARAMS = par.POLARIZATION_PARAMS
+    
+    # Rayleigh wave configuration
+    global USE_AUTO_BANDS, NUM_BANDS, PERIOD_MIN, PERIOD_MAX, OVERLAP_PERCENT
+    global BAND_HIGH, BAND_LOW
+    USE_AUTO_BANDS = par.USE_AUTO_BANDS
+    NUM_BANDS = par.NUM_BANDS
+    PERIOD_MIN = par.PERIOD_MIN
+    PERIOD_MAX = par.PERIOD_MAX
+    OVERLAP_PERCENT = par.OVERLAP_PERCENT
+    
+    # Generate frequency bands AFTER loading parameters
+    BAND_HIGH, BAND_LOW = common_utils.generate_frequency_bands(
+        USE_AUTO_BANDS, NUM_BANDS, PERIOD_MIN, PERIOD_MAX, OVERLAP_PERCENT
+    )
+    
+    print(f"\n{'='*80}")
+    print(f"PARAMETER FILE LOADED")
+    print(f"{'='*80}")
+    print(f"File: {args.par_file}")
+    print(f"Station: {FILES[0].split('.')[1] if len(FILES) > 0 else 'Unknown'}")
+    print(f"Event time: {EVENT_TIME if EVENT_TIME else 'Unknown (blind mode)'}")
+    print(f"Data directory: {DATA_DIR}")
+    print(f"{'='*80}\n")
+    
+    # Clean up old log files from previous runs
+    cleanup_old_logs()
+    
+    # Phase 1: Setup and validation
+    setup_result = setup_analysis(
+        FILES=FILES,
+        EVENT_TIME=EVENT_TIME,
+        SOURCE_DEPTH_KM=SOURCE_DEPTH_KM,
+        DISTANCE_DEG=DISTANCE_DEG,
+        DATA_DIR=DATA_DIR,
+        USE_INTERACTIVE_PICKING=USE_INTERACTIVE_PICKING
+    )
+    
+    if setup_result is None:
+        tee_print("ERROR: Setup failed. Exiting.")
+        close_log_file()
+        return
+    
+    # Unpack setup results
+    arrivals = setup_result['arrivals']
+    
+    # Phase 2: Stage 1 Analysis - Initial P & S picking
+    stage1_result = run_stage1_analysis(
+        FILES=FILES,
+        EVENT_TIME=EVENT_TIME,
+        STAGE1_PHASES=STAGE1_PHASES,
+        STAGE1_DISTANCE_RANGE=STAGE1_DISTANCE_RANGE,
+        STAGE1_DEPTH_RANGE=STAGE1_DEPTH_RANGE,
+        PICKER_PERIOD_LOW=PICKER_PERIOD_LOW,
+        PICKER_PERIOD_HIGH=PICKER_PERIOD_HIGH,
+        OUTPUT_DIR=OUTPUT_DIR,
+        arrivals=arrivals
+    )
+    
+    if stage1_result is None:
+        tee_print("ERROR: Stage 1 analysis failed. Exiting.")
+        close_log_file()
+        return
+    
+    # Unpack Stage 1 results
+    stage1_picks = stage1_result['stage1_picks']
+    stage1_distance = stage1_result['stage1_distance']
+    stage1_depth = stage1_result['stage1_depth']
+    st_pick_filt = stage1_result['st_pick_filt']
+    reference_time = stage1_result['reference_time']
+    t = stage1_result['t']
+    dataE_pick = stage1_result['dataE_pick']
+    dataN_pick = stage1_result['dataN_pick']
+    dataZ_pick = stage1_result['dataZ_pick']
+    start = stage1_result['start']
+    
+    if not stage1_picks or not stage1_picks.get('P'):
+        tee_print("ERROR: No P picks in Stage 1. Cannot proceed.")
+        close_log_file()
+        return
+    
+    # Phase 3: Rayleigh Wave Analysis (optional, user prompt)
+    rayleigh_result = run_rayleigh_and_stockwell_analysis(
+        stage1_distance=stage1_distance,
+        FILES=FILES,
+        EVENT_TIME=EVENT_TIME,
+        DISTANCE_DEG=DISTANCE_DEG,
+        OUTPUT_DIR=OUTPUT_DIR,
+        EVENT_NAME=EVENT_NAME
+    )
+    
+    # Extract Rayleigh results if available
+    rayleigh_distance = None
+    rayleigh_x = None
+    rayleigh_pdf = None
+    rayleigh_t0_x = None
+    rayleigh_t0_pdf = None
+    tr1 = None
+    band_high = None
+    band_low = None
+    updated_stage1_distance = stage1_distance
+    stockwell_results = None
+    stockwell_distance_pdf = None
+    stockwell_timing_pdf = None
+    detected_orbits = None
+    st_raw = None
+    
+    if rayleigh_result:
+        rayleigh_distance = rayleigh_result['rayleigh_distance']
+        rayleigh_x = rayleigh_result['rayleigh_x']
+        rayleigh_pdf = rayleigh_result['rayleigh_pdf']
+        rayleigh_t0_x = rayleigh_result['rayleigh_t0_x']
+        rayleigh_t0_pdf = rayleigh_result['rayleigh_t0_pdf']
+        tr1 = rayleigh_result['tr1']
+        band_high = rayleigh_result['band_high']
+        band_low = rayleigh_result['band_low']
+        updated_stage1_distance = rayleigh_result['updated_stage1_distance']
+        stockwell_results = rayleigh_result['stockwell_results']
+        stockwell_distance_pdf = rayleigh_result['stockwell_distance_pdf']
+        stockwell_timing_pdf = rayleigh_result['stockwell_timing_pdf']
+        detected_orbits = rayleigh_result['detected_orbits']
+        st_raw = rayleigh_result['st_raw']
+    
+    # Use updated distance for Stage 2 (may include Rayleigh wave refinement)
+    stage1_distance = updated_stage1_distance
+    
+    # Phase 4: Stage 2 Analysis - Refined multi-phase picking (user prompt)
+    proceed = input("\nWould you like to proceed to Stage 2 for refined multi-phase picking? (y/n): ")
+    
+    if proceed.lower() not in ['y', 'yes']:
+        tee_print("\nStage 2 skipped. Analysis complete with Stage 1 results.\n")
+        tee_print("\n" + "="*80)
+        tee_print("ANALYSIS COMPLETE")
+        tee_print("="*80)
+        tee_print(f"All figures have been saved to: {OUTPUT_DIR}")
+        close_log_file()
+        return
+    
+    stage2_result = run_stage2_analysis(
+        st_pick_filt=st_pick_filt,
+        reference_time=reference_time,
+        arrivals=arrivals,
+        t=t,
+        dataE_pick=dataE_pick,
+        dataN_pick=dataN_pick,
+        dataZ_pick=dataZ_pick,
+        start=start,
+        stage1_picks=stage1_picks,
+        stage1_distance=stage1_distance,
+        stage1_depth=stage1_depth,
+        OUTPUT_DIR=OUTPUT_DIR,
+        EVENT_NAME=EVENT_NAME,
+        STAGE2_PHASES=STAGE2_PHASES,
+        STAGE2_DISTANCE_BUFFER=STAGE2_DISTANCE_BUFFER,
+        STAGE2_DEPTH_BUFFER=STAGE2_DEPTH_BUFFER,
+        STAGE1_DISTANCE_RANGE=STAGE1_DISTANCE_RANGE,
+        STAGE1_DEPTH_RANGE=STAGE1_DEPTH_RANGE,
+        GRID_SEARCH_MODELS=GRID_SEARCH_MODELS
+    )
+    
+    if stage2_result is None:
+        tee_print("ERROR: Stage 2 analysis failed. Exiting.")
+        close_log_file()
+        return
+    
+    # Unpack Stage 2 results
+    stage2_picks = stage2_result['stage2_picks']
+    stage2_distance = stage2_result['stage2_distance']
+    stage2_depth = stage2_result['stage2_depth']
+    stage2_pdf = stage2_result['stage2_pdf']
+    stage2_distances = stage2_result['stage2_distances']
+    stage2_depths = stage2_result['stage2_depths']
+    to = stage2_result['to']
+    PDF_t0 = stage2_result['PDF_t0']
+    average_t0 = stage2_result['average_t0']
+    std_t0 = stage2_result['std_t0']
+    
+    # Phase 5: Combine PDFs and export comprehensive results
+    combined_result = combine_and_export_results(
+        rayleigh_distance=rayleigh_distance,
+        rayleigh_x=rayleigh_x,
+        rayleigh_pdf=rayleigh_pdf,
+        rayleigh_t0_x=rayleigh_t0_x,
+        rayleigh_t0_pdf=rayleigh_t0_pdf,
+        stage2_distance=stage2_distance,
+        stage2_distances=stage2_distances,
+        stage2_pdf=stage2_pdf,
+        stage2_depth=stage2_depth,
+        stage2_depths=stage2_depths,
+        to=to,
+        PDF_t0=PDF_t0,
+        average_t0=average_t0,
+        std_t0=std_t0,
+        stage2_picks=stage2_picks,
+        tr1=tr1,
+        band_high=band_high,
+        band_low=band_low,
+        stockwell_results=stockwell_results,
+        stockwell_distance_pdf=stockwell_distance_pdf,
+        stockwell_timing_pdf=stockwell_timing_pdf,
+        detected_orbits=detected_orbits,
+        OUTPUT_DIR=OUTPUT_DIR,
+        EVENT_NAME=EVENT_NAME,
+        STATION_NAME=STATION_NAME,
+        P_ARRIVAL_TIME=P_ARRIVAL_TIME,
+        EVENT_TIME=EVENT_TIME,
+        USE_KNOWN_ORIGIN=USE_KNOWN_ORIGIN,
+        DISTANCE_DEG=DISTANCE_DEG
+    )
+    
+    # Extract combined results
+    combined_distance = combined_result['combined_distance']
+    combined_distance_std = combined_result['combined_distance_std']
+    t0_combined_estimate = combined_result['combined_t0']
+    t0_combined_std = combined_result['combined_t0_std']
+    pickle_path = combined_result['pickle_path']
+    
+    # Phase 6: Polarization analysis for backazimuth (optional)
+    if not st_raw:
+        # Load raw data if not already loaded from Rayleigh analysis
+        st_raw = load_stream(FILES)
+    
+    baz_result = run_polarization_baz_analysis(
+        st_raw=st_raw,
+        stage2_picks=stage2_picks,
+        EVENT_TIME=EVENT_TIME,
+        OUTPUT_DIR=OUTPUT_DIR,
+        EVENT_NAME=EVENT_NAME,
+        stockwell_results=stockwell_results,
+        POLARIZATION_PARAMS=POLARIZATION_PARAMS
+    )
+    
+    # Extract BAZ results if available
+    baz_p = None
+    error_p = None
+    baz_pfroms = None
+    error_pfroms = None
+    baz_combined = None
+    baz_combined_std = None
+    
+    if baz_result:
+        baz_p = baz_result['p_baz']
+        error_p = baz_result['p_baz_error']
+        baz_pfroms = baz_result['pfroms_baz']
+        error_pfroms = baz_result['pfroms_error']
+        baz_combined = baz_result['combined_baz']
+        baz_combined_std = baz_result['combined_baz_std']
+    
+    # Phase 7: Print final comprehensive summary
+    print_final_comprehensive_summary(
+        combined_distance=combined_distance,
+        combined_std=combined_distance_std,
+        stage2_distance=stage2_distance,
+        stage2_depth=stage2_depth,
+        t0_combined_estimate=t0_combined_estimate,
+        t0_combined_std=t0_combined_std,
+        average_t0=average_t0,
+        baz_p=baz_p,
+        error_p=error_p,
+        baz_pfroms=baz_pfroms,
+        error_pfroms=error_pfroms,
+        baz_combined=baz_combined,
+        baz_combined_std=baz_combined_std
+    )
+    
+    # Phase 8: Final cleanup and exit
+    tee_print("\n" + "="*80)
+    tee_print("ANALYSIS COMPLETE")
+    tee_print("="*80)
+    tee_print(f"All figures have been saved to: {OUTPUT_DIR}")
+    if pickle_path:
+        tee_print(f"Comprehensive results saved to: {pickle_path}")
+    tee_print("\nFigure windows will remain open until you close them.")
+    input("\nPress Enter to close all plots and exit...")
+    tee_print("Closing all figures and exiting.")
+    
+    # Close log file
+    close_log_file()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        tee_print("\n\nAnalysis interrupted by user.")
+        close_log_file()
+    except Exception as e:
+        tee_print(f"\n\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        close_log_file()

@@ -33,7 +33,7 @@ Create conda environment with required packages:
 ```bash
 conda create -n seismic_analysis python=3.9
 conda activate seismic_analysis
-conda install -c conda-forge obspy numpy matplotlib scipy pyproj pandas
+conda install -c conda-forge obspy numpy matplotlib scipy pyproj pandas seaborn
 ```
 
 ### Working Directory
@@ -52,7 +52,7 @@ python sparse_data_analysis/sparse_data_distance_timing.py --par_file par_files/
 
 # Note the Results directory name created (e.g., Results_BFO_20150629_082243/)
 
-# Step 2: Backazimuth analysis (REQUIRES --pickle from Step 1)
+# Step 2: Backazimuth analysis (you must enter the pickle file generated during step 1)
 python sparse_data_analysis/backazimuth_analysis.py \
     --pickle Results_YYYYMMDD_HHMMSS/YYYYMMDD_HHMMSS_comprehensive_results.pkl \
     --par_file par_files/PAR_FILE_Peru.py
@@ -63,7 +63,10 @@ python sparse_data_analysis/backazimuth_analysis.py \
     --par_file par_files/PAR_FILE_Peru.py
 
 # Step 3: Monte Carlo location sampling
-python sparse_data_analysis/monte_carlo_sampler.py --results Results_YYYYMMDD_HHMMSS/ --samples 300
+python sparse_data_analysis/monte_carlo_sampler.py \
+    --results Results_YYYYMMDD_HHMMSS/ \
+    --samples 300 \
+    --par-file par_files/PAR_FILE_Peru.py
 
 # Step 4: Create location map (requires pygmt environment)
 conda activate pygmt_env
@@ -192,7 +195,7 @@ After running the full workflow:
 
 ```
 Results_YYYYMMDD_HHMMSS/
-├── YYYYMMDD_HHMMSS_distance_pdf.pkl          # Distance PDF (Step 1)
+├── YYYYMMDD_HHMMSS_comprehensive_results.pkl # Distance PDF data (Step 1)
 ├── YYYYMMDD_HHMMSS_Polarizationout.pkl       # BAZ PDF (Step 2)
 ├── mc_samples.csv                             # Lat/lon samples (Step 3)
 ├── location_map_density.png                   # Final map (Step 4)

@@ -23,6 +23,7 @@ References:
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import spectrogram
+from scipy.signal.windows import hann
 import matplotlib
 from matplotlib.colors import Normalize
 from obspy.signal.util import next_pow_2
@@ -33,8 +34,8 @@ from scipy import signal
 
 def hanning_2d(std):
     win = np.einsum('...i,...j->...ij',
-                    signal.hanning(std[0] + 2)[1:-1],
-                    signal.hanning(std[1] + 2)[1:-1])
+                    hann(std[0] + 2)[1:-1],
+                    hann(std[1] + 2)[1:-1])
     win /= np.sum(win)
     return win
 
@@ -75,7 +76,7 @@ def compute_polarization(u1, u2, u3, ntsum=1, dsfact=1, nfsum=1, dsfacf=1):
                         signal.convolve(S[..., j, k].imag, w, mode='same') * 1j
         else:
             assert len(ntsum) == u1.shape[0]
-            w_f = signal.hann(nfsum + 2)[1:-1] * np.ones((nfsum, 1))
+            w_f = hann(nfsum + 2)[1:-1] * np.ones((nfsum, 1))
             w_f /= np.sum(w_f, axis=0)
             for j in range(0, S.shape[2]):
                 for k in range(0, S.shape[3]):
@@ -85,7 +86,7 @@ def compute_polarization(u1, u2, u3, ntsum=1, dsfact=1, nfsum=1, dsfacf=1):
                         signal.convolve(S[..., j, k].imag, w_f,
                                         mode='same') * 1j
                     for i in range(0, S.shape[0]):
-                        w_t = signal.hann(ntsum[i])
+                        w_t = hann(ntsum[i])
                         w_t /= np.sum(w_t)
                         S[i, :, j, k] = \
                             signal.convolve(S[i, :, j, k], w_t, mode='same')
@@ -183,6 +184,11 @@ def pcolormesh_alpha(ax, x, y, val, alpha, vmin, vmax, cmap, bounds=None):
 
     # if val.shape = (len(x), len(y)), then pcolormesh neglects one column +
     # row in val, hence need to adapt alpha
+    # Matplotlib returns QuadMesh colors as either a flattened (n_cells, 4)
+    # array or a grid (n_y_cells, n_x_cells, 4), depending on its version.
+    # QuadMesh.set_color() requires flattened RGBA values, so normalize to that
+    # format before applying the matching flattened alpha mask.
+    colors = np.asarray(colors).reshape(-1, 4)
     colors[:, -1] = alpha[:len(y)-1, :len(x)-1].ravel()
     qm.set_color(colors)
 
@@ -200,8 +206,8 @@ def pcolormesh_alpha(ax, x, y, val, alpha, vmin, vmax, cmap, bounds=None):
 
 
 def _check_traces(st_Z, st_N, st_E, tstart, tend):
-    t0 = np.infty
-    t1 = -np.infty
+    t0 = np.inf
+    t1 = -np.inf
     for tr_Z, tr_N, tr_E in zip(st_Z, st_N, st_E):
         try:
             assert tr_N.stats.npts == tr_Z.stats.npts

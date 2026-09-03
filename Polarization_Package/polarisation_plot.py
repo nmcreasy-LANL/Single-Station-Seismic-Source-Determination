@@ -376,7 +376,7 @@ def plot_polarization_event_noise(st,
         ax.set_xlabel('')
 
     for ax in axes0[0:-1, 0]: #make it so that the spectrogram plots have linked x axes (i.e. time)
-        ax.get_shared_x_axes().join(ax, axes0[-1, 0])
+        ax.sharex(axes0[-1, 0])
 
     for ax in axes0[:, 1]: #remove y label for histograms
         ax.set_ylabel('')

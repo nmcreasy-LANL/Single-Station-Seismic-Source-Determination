@@ -95,7 +95,8 @@ def load_baz_pdf(pickle_path):
 
 def load_distance_pdf(pickle_path):
     """
-    Load distance PDF from distance pickle file.
+    Load distance PDF from either a standalone distance PDF pickle or a
+    comprehensive Step 1 results pickle.
     
     Returns:
         distance_x, distance_pdf (arrays)
@@ -104,13 +105,37 @@ def load_distance_pdf(pickle_path):
     
     with open(pickle_path, 'rb') as f:
         data = pickle.load(f)
+
+    if 'distance_x' in data and 'distance_pdf' in data:
+        distance_x = np.array(data['distance_x'])
+        distance_pdf = np.array(data['distance_pdf'])
+        estimated_distance = data.get('estimated_distance')
+        source = 'standalone distance PDF'
+    elif 'combined' in data:
+        combined = data['combined']
+        distance_x = np.array(combined['distance_pdf_x'])
+        distance_pdf = np.array(combined['distance_pdf_y'])
+        estimated_distance = combined.get('distance_estimate')
+        source = 'combined distance PDF from comprehensive results'
+    else:
+        raise ValueError(
+            'Unexpected pickle file structure - not a recognized distance PDF '
+            'or comprehensive results file'
+        )
+
+    if distance_x.size == 0 or distance_pdf.size == 0:
+        raise ValueError(f'The {source} contains an empty distance PDF')
+    if distance_x.shape != distance_pdf.shape:
+        raise ValueError(
+            f'Distance PDF axis and values have incompatible shapes: '
+            f'{distance_x.shape} and {distance_pdf.shape}'
+        )
     
-    distance_x = np.array(data['distance_x'])
-    distance_pdf = np.array(data['distance_pdf'])
-    
+    print(f"  Format: {source}")
     print(f"  Loaded distance PDF with {len(distance_x)} points")
     print(f"  Distance range: {np.min(distance_x):.2f}° to {np.max(distance_x):.2f}°")
-    print(f"  Estimated distance: {data['estimated_distance']:.2f}°")
+    if estimated_distance is not None:
+        print(f"  Estimated distance: {estimated_distance:.2f}°")
     
     return distance_x, distance_pdf
 
@@ -193,9 +218,8 @@ def main():
                        help='Results directory containing pickle files')
     parser.add_argument('--samples', type=int, default=300,
                        help='Number of Monte Carlo samples (default: 300)')
-    parser.add_argument('--sac-file', type=str, 
-                       default='data/Peru/II.BFO.00.BHZ.M.2015.180.082243.SAC',
-                       help='SAC file for station coordinates')
+    parser.add_argument('--sac-file', type=str, default=None,
+                       help='SAC file for station coordinates (defaults to the first file in --par-file)')
     parser.add_argument('--par-file', type=str, required=True,
                        help='Parameter file (contains TRUE_EVENT_LAT/LON if known)')
     
@@ -209,6 +233,20 @@ def main():
         true_event_lon = getattr(par, 'TRUE_EVENT_LON', None)
     except Exception as e:
         print(f"ERROR: Failed to load PAR_FILE: {e}")
+        return 1
+
+    if args.sac_file is None:
+        try:
+            args.sac_file = os.path.join(par.DATA_DIR, par.FILES[0])
+            print(f"Using SAC file from parameter file: {args.sac_file}")
+        except (AttributeError, IndexError) as e:
+            print(f"ERROR: Could not determine a SAC file from {args.par_file}: {e}")
+            print("Please provide one explicitly with --sac-file PATH")
+            return 1
+
+    if not os.path.isfile(args.sac_file):
+        print(f"ERROR: SAC file not found: {args.sac_file}")
+        print("Provide the correct path with --sac-file PATH")
         return 1
     
     print("="*80)
@@ -255,11 +293,21 @@ def main():
                 print(f"  Found alternate pattern: {file}")
                 break
     
-    # Search for distance PDF
+    # Search for a standalone distance PDF (legacy format)
     for file in os.listdir(args.results):
         if file.endswith('_distance_pdf.pkl'):
             distance_pickle = os.path.join(args.results, file)
+            print(f"Found standalone distance PDF: {file}")
             break
+
+    # Current Step 1 output stores the distance PDF in the comprehensive pickle.
+    if distance_pickle is None:
+        print("Standalone distance PDF not found, searching for comprehensive results...")
+        for file in os.listdir(args.results):
+            if file.endswith('_comprehensive_results.pkl'):
+                distance_pickle = os.path.join(args.results, file)
+                print(f"Found comprehensive results for distance PDF: {file}")
+                break
     
     # Error handling
     if baz_pickle is None:
@@ -272,7 +320,8 @@ def main():
         return
     
     if distance_pickle is None:
-        print("ERROR: Could not find distance PDF pickle file (*_distance_pdf.pkl)")
+        print("ERROR: Could not find a distance PDF source")
+        print("  Searched for: *_distance_pdf.pkl or *_comprehensive_results.pkl")
         return
     
     print("Found required files:")
@@ -448,24 +497,46 @@ def main():
     lon_ci_lower = np.percentile(event_lons, 2.5)
     lon_ci_upper = np.percentile(event_lons, 97.5)
     
-    # Calculate error from true location (if known)
+    # Calculate KDE peak location (needed for all subplots)
+    print("\nCalculating 2D KDE peak location...")
+    from scipy.stats import gaussian_kde
+    xy = np.vstack([event_lons, event_lats])
+    kde_2d = gaussian_kde(xy, bw_method=0.1)  # Match PyGMT bandwidth
+
+    # Create grid for KDE evaluation
+    lon_grid = np.linspace(event_lons.min(), event_lons.max(), 100)
+    lat_grid = np.linspace(event_lats.min(), event_lats.max(), 100)
+    lon_mesh, lat_mesh = np.meshgrid(lon_grid, lat_grid)
+    positions = np.vstack([lon_mesh.ravel(), lat_mesh.ravel()])
+    density = kde_2d(positions).reshape(lon_mesh.shape)
+
+    # Find estimated location as peak of KDE (maximum density) - MATCHING PYGMT METHOD
+    max_density_idx = np.argmax(density)
+    kde_peak_lat = lat_mesh.ravel()[max_density_idx]
+    kde_peak_lon = lon_mesh.ravel()[max_density_idx]
+
+    print(f"  KDE Peak location: {kde_peak_lat:.4f}°, {kde_peak_lon:.4f}°")
+    print(f"  Simple Mean location: {lat_mean:.4f}°, {lon_mean:.4f}°")
+
+    # Calculate errors from the true location (if known).
     if true_event_lat is not None and true_event_lon is not None:
         g = Geod(ellps='WGS84')
         _, _, dist_error_m = g.inv(lon_mean, lat_mean, true_event_lon, true_event_lat)
         dist_error_km = dist_error_m / 1000.0
-        
-        # Calculate error relative to KDE peak (most likely location)
         lat_error = kde_peak_lat - true_event_lat
         lon_error = kde_peak_lon - true_event_lon
+        _, _, dist_kde_error_m = g.inv(kde_peak_lon, kde_peak_lat, true_event_lon, true_event_lat)
+        dist_kde_error_km = dist_kde_error_m / 1000.0
+        print(f"  KDE Peak error: {dist_kde_error_km:.2f} km")
     else:
         dist_error_km = None
         lat_error = None
         lon_error = None
-    
+
     # Print statistics
     print("\nLatitude Statistics:")
     if lat_error is not None:
-        print(f"  Mean:   {lat_mean:.4f}° (error: {lat_error:+.4f}°)")
+        print(f"  Mean:   {lat_mean:.4f}° (KDE peak error: {lat_error:+.4f}°)")
     else:
         print(f"  Mean:   {lat_mean:.4f}°")
     print(f"  Median: {lat_median:.4f}°")
@@ -473,10 +544,10 @@ def main():
     print(f"  95% CI: [{lat_ci_lower:.4f}°, {lat_ci_upper:.4f}°]")
     if true_event_lat is not None:
         print(f"  True:   {true_event_lat:.4f}°")
-    
+
     print("\nLongitude Statistics:")
     if lon_error is not None:
-        print(f"  Mean:   {lon_mean:.4f}° (error: {lon_error:+.4f}°)")
+        print(f"  Mean:   {lon_mean:.4f}° (KDE peak error: {lon_error:+.4f}°)")
     else:
         print(f"  Mean:   {lon_mean:.4f}°")
     print(f"  Median: {lon_median:.4f}°")
@@ -484,37 +555,9 @@ def main():
     print(f"  95% CI: [{lon_ci_lower:.4f}°, {lon_ci_upper:.4f}°]")
     if true_event_lon is not None:
         print(f"  True:   {true_event_lon:.4f}°")
-    
+
     if dist_error_km is not None:
-        print(f"\nDistance Error: {dist_error_km:.2f} km")
-    
-    # Calculate KDE peak location (needed for all subplots)
-    print("\nCalculating 2D KDE peak location...")
-    from scipy.stats import gaussian_kde
-    xy = np.vstack([event_lons, event_lats])
-    kde_2d = gaussian_kde(xy, bw_method=0.1)  # Match PyGMT bandwidth
-    
-    # Create grid for KDE evaluation
-    lon_grid = np.linspace(event_lons.min(), event_lons.max(), 100)
-    lat_grid = np.linspace(event_lats.min(), event_lats.max(), 100)
-    lon_mesh, lat_mesh = np.meshgrid(lon_grid, lat_grid)
-    positions = np.vstack([lon_mesh.ravel(), lat_mesh.ravel()])
-    density = kde_2d(positions).reshape(lon_mesh.shape)
-    
-    # Find estimated location as peak of KDE (maximum density) - MATCHING PYGMT METHOD
-    max_density_idx = np.argmax(density)
-    kde_peak_lat = lat_mesh.ravel()[max_density_idx]
-    kde_peak_lon = lon_mesh.ravel()[max_density_idx]
-    
-    print(f"  KDE Peak location: {kde_peak_lat:.4f}°, {kde_peak_lon:.4f}°")
-    print(f"  Simple Mean location: {lat_mean:.4f}°, {lon_mean:.4f}°")
-    
-    # Calculate distance between KDE peak and true event (if known)
-    if true_event_lat is not None and true_event_lon is not None:
-        g = Geod(ellps='WGS84')
-        _, _, dist_kde_error_m = g.inv(kde_peak_lon, kde_peak_lat, true_event_lon, true_event_lat)
-        dist_kde_error_km = dist_kde_error_m / 1000.0
-        print(f"  KDE Peak error: {dist_kde_error_km:.2f} km")
+        print(f"\nMean location error: {dist_error_km:.2f} km")
     
     # Create figure with 3 subplots
     fig2 = plt.figure(figsize=(14, 10))

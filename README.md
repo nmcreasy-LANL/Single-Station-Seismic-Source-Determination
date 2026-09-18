@@ -1,13 +1,15 @@
-# Seismic Event Location Analysis - Quick Start Guide
+# Single Station Seismic Source Discimination - Quick Start Guide
 
 **Single-station seismic event location using sparse data analysis**
 
-**Author:** Neala Creasy
+**Author:** Neala Creasy, David Li, Brent Delbridge, and Brennon Brunsvik
 
 assistance with AI Claude for visualization, readme, and organization 
 
 **Institution:** Los Alamos National Laboratory  
 **Last Updated:** 2026-07-24
+
+O# (O5174) 
 
 ---
 
